@@ -221,7 +221,6 @@ class VisionOCREngine:
             "language": lang,
             "OCREngine": self.OCR_ENGINE,
             "isOverlayRequired": "true",
-            "scale": "true",
             "detectOrientation": "true",
         }
         files = {"file": ("frame.jpg", image_bytes, "image/jpeg")}
@@ -278,21 +277,42 @@ class VisionOCREngine:
 
             overlay = parsed.get("TextOverlay") or {}
             for line in overlay.get("Lines", []) or []:
-                for word in line.get("Words", []) or []:
-                    word_text = word.get("WordText", "")
-                    if not word_text:
-                        continue
+                words = line.get("Words", []) or []
+                if not words:
+                    continue
+
+                # Build ONE bounding box that spans the whole line (rather
+                # than a separate box per word) so we draw a single readable
+                # label per line instead of one black label stacked above
+                # every individual word -- the latter is what produced solid
+                # black bars over dense text.
+                lefts, tops, rights, bottoms = [], [], [], []
+                for word in words:
                     left = int(word.get("Left", 0))
                     top = int(word.get("Top", 0))
                     width = int(word.get("Width", 0))
                     height = int(word.get("Height", 0))
-                    poly = [
-                        (left, top),
-                        (left + width, top),
-                        (left + width, top + height),
-                        (left, top + height),
-                    ]
-                    items.append(VisionOCRItem(text=word_text, confidence=1.0, bounding_poly=poly))
+                    lefts.append(left)
+                    tops.append(top)
+                    rights.append(left + width)
+                    bottoms.append(top + height)
+
+                x_min, y_min = min(lefts), min(tops)
+                x_max, y_max = max(rights), max(bottoms)
+
+                line_text = (line.get("LineText") or "").strip()
+                if not line_text:
+                    line_text = " ".join(w.get("WordText", "") for w in words).strip()
+                if not line_text:
+                    continue
+
+                poly = [
+                    (x_min, y_min),
+                    (x_max, y_min),
+                    (x_max, y_max),
+                    (x_min, y_max),
+                ]
+                items.append(VisionOCRItem(text=line_text, confidence=1.0, bounding_poly=poly))
 
         full_text = "\n".join(full_text_parts)
 
@@ -391,11 +411,13 @@ def draw_ocr_overlay(
     bg_color: Tuple[int, int, int] = (0, 0, 0),
     show_boxes: bool = True,
     show_labels: bool = True,
+    label_opacity: float = 0.0,
 ) -> np.ndarray:
     if ocr_result is None or not ocr_result.success or not ocr_result.items:
         return frame
 
     annotated = frame.copy()
+    frame_h, frame_w = annotated.shape[:2]
 
     for item in ocr_result.items:
         poly = np.array(item.bounding_poly, dtype=np.int32)
@@ -408,29 +430,43 @@ def draw_ocr_overlay(
             cv2.polylines(annotated, [poly_reshaped], isClosed=True, color=box_color, thickness=2)
 
         if show_labels and item.text:
-            x_min = min(pt[0] for pt in item.bounding_poly)
-            y_min = min(pt[1] for pt in item.bounding_poly)
+            x_min = max(0, min(pt[0] for pt in item.bounding_poly))
+            y_min = max(0, min(pt[1] for pt in item.bounding_poly))
+            y_max = min(frame_h, max(pt[1] for pt in item.bounding_poly))
 
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.5
             thickness = 1
 
             (text_w, text_h), baseline = cv2.getTextSize(item.text, font, font_scale, thickness)
-            tag_y1 = max(0, y_min - text_h - 6)
-            tag_y2 = y_min
+            label_w = min(text_w + 8, frame_w - x_min)
 
-            cv2.rectangle(
-                annotated,
-                (x_min, tag_y1),
-                (x_min + text_w + 6, tag_y2),
-                bg_color,
-                cv2.FILLED,
-            )
+            # Prefer placing the label just above the box; if there's no
+            # room (box is near the top edge), place it just below instead
+            # so it never gets clipped off-screen or squashed to zero height.
+            if y_min - text_h - 8 >= 0:
+                tag_y1 = y_min - text_h - 8
+                tag_y2 = y_min
+            else:
+                tag_y1 = y_max
+                tag_y2 = min(frame_h, y_max + text_h + 8)
+
+            tag_x1 = x_min
+            tag_x2 = min(frame_w, x_min + label_w)
+
+            # Keep the text label itself lightweight and transparent so it no
+            # longer blocks nearby words or creates dark rectangular artifacts.
+            if label_opacity > 0.0:
+                label_region = annotated[tag_y1:tag_y2, tag_x1:tag_x2]
+                if label_region.size > 0:
+                    overlay_box = np.full_like(label_region, bg_color, dtype=np.uint8)
+                    blended = cv2.addWeighted(overlay_box, label_opacity, label_region, 1 - label_opacity, 0)
+                    annotated[tag_y1:tag_y2, tag_x1:tag_x2] = blended
 
             annotated = draw_unicode_text(
                 annotated,
                 item.text,
-                (x_min + 3, max(text_h, y_min - 3)),
+                (tag_x1 + 4, max(text_h, tag_y2 - 6)),
                 text_color,
                 font_size=max(16, int(font_scale * 24)),
             )
