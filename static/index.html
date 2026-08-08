@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time OCR.space Vision OCR Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0b0f19;
+      --card-bg: rgba(18, 26, 43, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent-cyan: #00f2fe;
+      --accent-blue: #4facfe;
+      --accent-green: #00e676;
+      --accent-purple: #7f00ff;
+      --text-main: #f0f4f8;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Outfit', sans-serif;
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(at 10% 10%, rgba(0, 242, 254, 0.05) 0px, transparent 50%),
+        radial-gradient(at 90% 90%, rgba(127, 0, 255, 0.08) 0px, transparent 50%);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Header Bar */
+    header {
+      background: rgba(11, 15, 25, 0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--card-border);
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      width: 38px;
+      height: 38px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 1.2rem;
+      color: #fff;
+      box-shadow: 0 0 20px rgba(0, 242, 254, 0.3);
+    }
+
+    .brand-title {
+      font-size: 1.3rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #ffffff, #a5f3fc);
+      background-clip: text;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .badge {
+      background: rgba(0, 230, 118, 0.12);
+      border: 1px solid rgba(0, 230, 118, 0.3);
+      color: var(--accent-green);
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 20px;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      background-color: var(--accent-green);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    /* Layout Grid */
+    main {
+      flex: 1;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 1.5rem;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      gap: 1.5rem;
+    }
+
+    @media (max-width: 1024px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Video Feed Container */
+    .viewport-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      backdrop-filter: blur(12px);
+      padding: 1.2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      position: relative;
+    }
+
+    .viewport-wrapper {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .hud-overlay {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      right: 14px;
+      display: flex;
+      justify-content: space-between;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    .hud-pill {
+      background: rgba(11, 15, 25, 0.75);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .hud-value {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent-cyan);
+      font-weight: 600;
+    }
+
+    /* Controls Bar */
+    .controls-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 10px;
+    }
+
+    button {
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 10px 18px;
+      border-radius: 12px;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+      color: #0b0f19;
+      box-shadow: 0 4px 15px rgba(0, 242, 254, 0.25);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 242, 254, 0.4);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.06);
+      color: #f1f5f9;
+      border: 1px solid var(--card-border);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.25);
+    }
+
+    .file-input-wrapper {
+      position: relative;
+    }
+
+    .file-input-wrapper input[type="file"] {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    /* Sidebar / Text Results */
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    .panel-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      backdrop-filter: blur(12px);
+      padding: 1.2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 10px;
+    }
+
+    .panel-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+
+    .ocr-results-box {
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+      padding: 1rem;
+      min-height: 160px;
+      max-height: 260px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      line-height: 1.6;
+      color: #38bdf8;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .item-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
+    .ocr-item-chip {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 10px;
+      padding: 8px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.85rem;
+    }
+
+    .chip-text {
+      color: #e2e8f0;
+      font-weight: 500;
+    }
+
+    .chip-conf {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--accent-green);
+      background: rgba(0, 230, 118, 0.1);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    .status-alert {
+      font-size: 0.85rem;
+      padding: 10px 14px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .alert-info {
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.2);
+      color: #7dd3fc;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-icon">V</div>
+      <div class="brand-title">OCR.space Vision Dashboard</div>
+    </div>
+    <div class="badge">
+      <div class="badge-dot"></div>
+      <span id="engineBadge">Engine: OCR.space</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left Camera Viewport -->
+    <div class="viewport-card">
+      <div class="viewport-wrapper">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="overlayCanvas"></canvas>
+        <div class="hud-overlay">
+          <div class="hud-pill">
+            <span>FPS:</span>
+            <span id="fpsVal" class="hud-value">0.0</span>
+          </div>
+          <div class="hud-pill">
+            <span>Latency:</span>
+            <span id="latencyVal" class="hud-value">0 ms</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="controls-row">
+        <div class="btn-group">
+          <button id="toggleCamBtn" class="btn-primary">
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+            Start Camera
+          </button>
+          <button id="scanBtn" class="btn-secondary" disabled>
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v8M8 12h8"></path></svg>
+            Scan Frame
+          </button>
+        </div>
+
+        <div class="btn-group">
+          <div class="file-input-wrapper">
+            <button class="btn-secondary">
+              <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+              Upload Image
+            </button>
+            <input type="file" id="imageUploader" accept="image/*">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Sidebar Results -->
+    <div class="sidebar">
+      <div class="panel-card">
+        <div class="panel-header">
+          <div class="panel-title">Extracted Text Output</div>
+          <button id="copyBtn" class="btn-secondary" style="padding: 4px 10px; font-size: 0.8rem;">Copy</button>
+        </div>
+        <div id="fullTextOutput" class="ocr-results-box">(No text detected yet)</div>
+      </div>
+
+      <div class="panel-card">
+        <div class="panel-header">
+          <div class="panel-title">Detected Text Blocks</div>
+          <span id="blockCount" style="font-size: 0.8rem; color: var(--text-muted);">0 blocks</span>
+        </div>
+        <div id="itemList" class="item-list">
+          <div style="font-size: 0.85rem; color: var(--text-muted); text-align: center; padding: 1rem;">
+            Detected words and confidence scores will appear here.
+          </div>
+        </div>
+      </div>
+
+      <div class="status-alert alert-info">
+        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        <span id="statusMessage">Camera ready. Click "Start Camera" for live web OCR stream.</span>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('overlayCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const toggleCamBtn = document.getElementById('toggleCamBtn');
+    const scanBtn = document.getElementById('scanBtn');
+    const imageUploader = document.getElementById('imageUploader');
+    const copyBtn = document.getElementById('copyBtn');
+
+    const fullTextOutput = document.getElementById('fullTextOutput');
+    const itemList = document.getElementById('itemList');
+    const blockCount = document.getElementById('blockCount');
+    const fpsVal = document.getElementById('fpsVal');
+    const latencyVal = document.getElementById('latencyVal');
+    const engineBadge = document.getElementById('engineBadge');
+    const statusMessage = document.getElementById('statusMessage');
+
+    let stream = null;
+    let isScanning = false;
+    let scanInterval = null;
+    let lastFrameTime = performance.now();
+    let frameCount = 0;
+
+    // Toggle Camera Stream
+    toggleCamBtn.addEventListener('click', async () => {
+      if (stream) {
+        stopCamera();
+      } else {
+        await startCamera();
+      }
+    });
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "environment" }
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        canvas.width = video.videoWidth || 1280;
+        canvas.height = video.videoHeight || 720;
+
+        toggleCamBtn.textContent = 'Stop Camera';
+        toggleCamBtn.classList.replace('btn-primary', 'btn-danger');
+        scanBtn.disabled = false;
+
+        statusMessage.textContent = 'Live camera stream running. Auto-scanning active.';
+        startAutoScan();
+      } catch (err) {
+        alert('Webcam access error: ' + err.message);
+        statusMessage.textContent = 'Error accessing camera: ' + err.message;
+      }
+    }
+
+    function stopCamera() {
+      if (scanInterval) clearInterval(scanInterval);
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      toggleCamBtn.textContent = 'Start Camera';
+      toggleCamBtn.classList.replace('btn-danger', 'btn-primary');
+      scanBtn.disabled = true;
+      statusMessage.textContent = 'Camera stopped.';
+      fpsVal.textContent = '0.0';
+    }
+
+    function startAutoScan() {
+      if (scanInterval) clearInterval(scanInterval);
+      scanInterval = setInterval(() => {
+        if (stream && !isScanning) {
+          captureAndScan();
+        }
+      }, 1500); // Scan frame every 1.5 seconds
+    }
+
+    scanBtn.addEventListener('click', () => {
+      if (stream) captureAndScan();
+    });
+
+    async function captureAndScan() {
+      if (isScanning || !stream) return;
+      isScanning = true;
+
+      // Draw current video frame to offscreen canvas
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = video.videoWidth || 1280;
+      offCanvas.height = video.videoHeight || 720;
+      const offCtx = offCanvas.getContext('2d');
+      offCtx.drawImage(video, 0, 0, offCanvas.width, offCanvas.height);
+
+      // Convert to blob and send to backend API
+      offCanvas.toBlob(async (blob) => {
+        if (!blob) { isScanning = false; return; }
+        await sendOcrRequest(blob, offCanvas.width, offCanvas.height);
+        isScanning = false;
+      }, 'image/jpeg', 0.85);
+    }
+
+    imageUploader.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const img = new Image();
+      img.onload = async () => {
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        await sendOcrRequest(file, img.width, img.height);
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    async function sendOcrRequest(fileOrBlob, width, height) {
+      const formData = new FormData();
+      formData.append('file', fileOrBlob, 'frame.jpg');
+
+      const start = performance.now();
+      statusMessage.textContent = 'Processing OCR...';
+
+      try {
+        const response = await fetch('/api/v1/ocr', {
+          method: 'POST',
+          body: formData
+        });
+
+        const data = await response.json();
+        const latency = Math.round(performance.now() - start);
+        latencyVal.textContent = `${data.latency_ms ? Math.round(data.latency_ms) : latency} ms`;
+
+        if (data.success) {
+          renderOcrResults(data, width, height);
+          engineBadge.textContent = 'Engine: ' + (data.engine_name || 'OCR.space');
+          statusMessage.textContent = 'OCR completed successfully.';
+        } else {
+          engineBadge.textContent = 'Engine: ' + (data.engine_name || 'Offline Fallback');
+          statusMessage.textContent = 'OCR Notice: ' + (data.error || 'No text detected.');
+        }
+      } catch (err) {
+        statusMessage.textContent = 'Network/API error: ' + err.message;
+      }
+    }
+
+    function renderOcrResults(data, width, height) {
+      // Clear canvas overlays
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Render full text
+      fullTextOutput.textContent = data.full_text || '(No text detected)';
+
+      // Render items chip list
+      itemList.innerHTML = '';
+      blockCount.textContent = `${data.items.length} blocks`;
+
+      if (data.items.length === 0) {
+        itemList.innerHTML = '<div style="font-size:0.85rem; color:var(--text-muted); text-align:center; padding:1rem;">No text items detected.</div>';
+        return;
+      }
+
+      data.items.forEach(item => {
+        // Draw bounding box
+        if (item.bounding_poly && item.bounding_poly.length > 0) {
+          ctx.beginPath();
+          ctx.moveTo(item.bounding_poly[0][0], item.bounding_poly[0][1]);
+          for (let i = 1; i < item.bounding_poly.length; i++) {
+            ctx.lineTo(item.bounding_poly[i][0], item.bounding_poly[i][1]);
+          }
+          ctx.closePath();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#00f2fe';
+          ctx.stroke();
+
+          ctx.fillStyle = 'rgba(0, 242, 254, 0.15)';
+          ctx.fill();
+
+          // Label text above box
+          const x = item.bounding_poly[0][0];
+          const y = Math.max(16, item.bounding_poly[0][1] - 6);
+          ctx.font = '600 14px "JetBrains Mono", monospace';
+          ctx.fillStyle = '#00f2fe';
+          ctx.fillText(item.text, x, y);
+        }
+
+        // Chip item
+        const chip = document.createElement('div');
+        chip.className = 'ocr-item-chip';
+        chip.innerHTML = `
+          <span class="chip-text">${escapeHtml(item.text)}</span>
+          <span class="chip-conf">${(item.confidence * 100).toFixed(0)}%</span>
+        `;
+        itemList.appendChild(chip);
+      });
+    }
+
+    copyBtn.addEventListener('click', () => {
+      const text = fullTextOutput.textContent;
+      if (text && text !== '(No text detected yet)') {
+        navigator.clipboard.writeText(text);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+      }
+    });
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // FPS Counter loop
+    function updateFps() {
+      const now = performance.now();
+      frameCount++;
+      if (now - lastFrameTime >= 1000) {
+        fpsVal.textContent = (frameCount * 1000 / (now - lastFrameTime)).toFixed(1);
+        frameCount = 0;
+        lastFrameTime = now;
+      }
+      requestAnimationFrame(updateFps);
+    }
+    requestAnimationFrame(updateFps);
+  </script>
+</body>
+</html>
