@@ -20,6 +20,7 @@ import cv2
 
 import config
 from vision_ocr import VisionOCREngine, VisionOCRResult, draw_ocr_overlay, draw_unicode_text
+from tts import IndicParlerTTSEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WebcamOCR")
@@ -50,6 +51,7 @@ def draw_status_header(
     engine_name: str,
     last_text: str,
     error_msg: Optional[str] = None,
+    tts_muted: bool = False,
 ) -> np.ndarray:
     annotated = frame.copy()
     h, w = annotated.shape[:2]
@@ -58,8 +60,12 @@ def draw_status_header(
     cv2.rectangle(annotated, (0, 0), (w, banner_height), config.HEADER_BG_COLOR_BGR, cv2.FILLED)
     cv2.line(annotated, (0, banner_height), (w, banner_height), (100, 100, 100), 1)
 
-    # Line 1: Status, Engine, FPS, Latency
-    info_str = f"Status: {status_text} | Engine: {engine_name} | FPS: {fps:.1f} | Latency: {latency_ms:.1f}ms"
+    # Line 1: Status, Engine, FPS, Latency, TTS
+    tts_str = "Muted" if tts_muted else "On"
+    info_str = (
+        f"Status: {status_text} | Engine: {engine_name} | "
+        f"FPS: {fps:.1f} | Latency: {latency_ms:.1f}ms | TTS: {tts_str}"
+    )
     cv2.putText(
         annotated,
         info_str,
@@ -91,7 +97,7 @@ def draw_status_header(
     )
 
     # Bottom helper bar
-    help_str = "Press 'q': Quit | 's': Force OCR | 'c': Clear"
+    help_str = "Press 'q': Quit | 's': Force OCR | 'c': Clear | 'm': Mute/Unmute TTS"
     cv2.putText(
         annotated,
         help_str,
@@ -140,6 +146,13 @@ def main():
             "Set OCRSPACE_API_KEY in your .env to use OCR.space."
         )
 
+    tts = IndicParlerTTSEngine()
+    tts_muted = not config.ENABLE_TTS
+    if tts.enabled:
+        logger.info("TTS backend: AI4Bharat Indic Parler-TTS (model loads lazily on first speech request).")
+    else:
+        logger.warning("TTS disabled (config.ENABLE_TTS=False / ENABLE_TTS env var).")
+
     logger.info(f"Opening camera source (index={config.CAMERA_INDEX})...")
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
 
@@ -160,6 +173,7 @@ def main():
     prev_gray: Optional[np.ndarray] = None
     last_detection_time = 0.0
     current_ocr_result: Optional[VisionOCRResult] = None
+    last_real_text = ""
     status_text = "Idle"
     engine_name = engine.mode
     is_processing = False
@@ -198,9 +212,36 @@ def main():
 
                     if result.success:
                         status_text = f"Ready ({result.latency_ms:.0f}ms)"
+
+                        normalized_text = engine._normalize_text(result.full_text)
+                        if normalized_text:
+                            last_real_text = normalized_text
+
+                        # Explicit console log of which engine actually
+                        # produced this result, so it's unambiguous without
+                        # having to read the small on-screen video overlay.
+                        logger.info(
+                            f"OCR result via [{result.engine_name}] "
+                            f"({result.latency_ms:.0f}ms): "
+                            f"'{normalized_text[:80]}{'...' if len(normalized_text) > 80 else ''}'"
+                            if normalized_text else
+                            f"OCR result via [{result.engine_name}] ({result.latency_ms:.0f}ms): (no text detected)"
+                        )
+
+                        if (
+                            not tts_muted
+                            and normalized_text
+                        ):
+                            if tts.busy:
+                                logger.info(
+                                    "TTS still speaking a previous result -- "
+                                    "skipping this one to avoid a backlog."
+                                )
+                            else:
+                                tts.speak(normalized_text)
                     else:
                         status_text = "Error"
-                        logger.error(f"OCR Error: {result.error}")
+                        logger.error(f"OCR Error via [{engine_name}]: {result.error}")
 
                 except Exception as e:
                     logger.error(f"OCR thread exception: {e}")
@@ -251,7 +292,7 @@ def main():
                     show_labels=config.SHOW_TEXT_LABELS,
                 )
 
-            last_text_str = current_ocr_result.full_text if current_ocr_result else ""
+            last_text_str = last_real_text if last_real_text else (current_ocr_result.full_text if current_ocr_result else "")
             latency_ms = current_ocr_result.latency_ms if current_ocr_result else 0.0
             error_msg = current_ocr_result.error if (current_ocr_result and current_ocr_result.error) else None
 
@@ -263,6 +304,7 @@ def main():
                 engine_name=engine_name,
                 last_text=last_text_str,
                 error_msg=error_msg,
+                tts_muted=tts_muted,
             )
             progress_frame = draw_ocr_progress_window(
                 status_text=status_text,
@@ -283,11 +325,15 @@ def main():
             elif key == ord("c"):
                 current_ocr_result = None
                 status_text = "Cleared"
+            elif key == ord("m"):
+                tts_muted = not tts_muted
+                logger.info(f"TTS {'muted' if tts_muted else 'unmuted'}.")
 
     except KeyboardInterrupt:
         pass
     finally:
         executor.shutdown(wait=False)
+        tts.stop()
         cap.release()
         cv2.destroyAllWindows()
         logger.info("Webcam application closed.")

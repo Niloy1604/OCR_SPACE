@@ -7,3 +7,12 @@ uvicorn>=0.22.0
 python-multipart>=0.0.6
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+
+# --- AI4Bharat Indic Parler-TTS ---
+torch>=2.1.0
+transformers>=4.46.0
+# parler-tts is not on PyPI; install straight from GitHub
+git+https://github.com/huggingface/parler-tts.git
+sounddevice>=0.4.6      # audio playback
+soundfile>=0.12.1       # optional: for saving generated audio to .wav
+pyttsx3>=2.90           # optional fallback speech engine for realtime local playback

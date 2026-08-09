@@ -49,17 +49,10 @@ class VisionOCREngine:
     detector so the app can still report approximate text locations offline.
     """
 
-    # OCR.space only exposes engines 1, 2 and 3 (there is no "3.1" variant in
-    # their public API) -- engine 3 is their newest / most accurate engine, so
-    # that's what we request here.
+    # OCR.space Engine 3 (primary) with automatic Engine 2 fallback.
     OCR_ENGINE = "3"
+    FALLBACK_OCR_ENGINE = "2"
 
-    # Maps common short language codes to the codes OCR.space Engine 3 expects.
-    # Indian languages are limited to what OCR.space's 200+ language list
-    # actually supports: Hindi, Bengali, Gujarati, Kannada, Malayalam,
-    # Marathi, Nepali, Urdu. Tamil, Telugu, Punjabi, Odia, Assamese, and
-    # Sanskrit are NOT in OCR.space's supported language list as of this
-    # writing, so they cannot be requested here.
     _LANGUAGE_MAP = {
         "en": "eng", "eng": "eng",
         "hi": "hin", "hin": "hin",
@@ -87,12 +80,7 @@ class VisionOCREngine:
         "uk": "ukr", "ukr": "ukr",
     }
 
-    # OCR.space Engine 3 supports "auto" as the language parameter, which lets
-    # it auto-detect the script across its entire 200+ language list rather
-    # than being locked to a single code. This is the recommended way to
-    # cover multiple Indian scripts (Hindi, Bengali, Gujarati, Kannada,
-    # Malayalam, Marathi, Nepali, Urdu, etc.) in one request without having
-    # to guess which single language a given frame contains.
+    
     AUTO_LANGUAGE = "auto"
 
     def __init__(self, use_document_text: bool = False):
@@ -128,6 +116,29 @@ class VisionOCREngine:
     @classmethod
     def _map_language(cls, hint: str) -> str:
         return cls._LANGUAGE_MAP.get((hint or "").strip().lower(), "eng")
+
+    @staticmethod
+    def _normalize_text(text: Optional[str]) -> str:
+        if not text:
+            return ""
+
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return ""
+
+        placeholders = {
+            "*[no text detected]*",
+            "[no text detected]",
+            "no text detected",
+            "no text detected yet",
+        }
+        if cleaned.lower() in placeholders:
+            return ""
+
+        if cleaned.lower().startswith("*[no text detected") or cleaned.lower().startswith("[no text detected"):
+            return ""
+
+        return cleaned
 
     @classmethod
     def _resolve_request_language(cls, language_hints: Optional[List[str]]) -> str:
@@ -216,114 +227,138 @@ class VisionOCREngine:
         start_time = time.perf_counter()
         lang = self._resolve_request_language(language_hints)
 
-        payload = {
-            "apikey": self.api_key,
-            "language": lang,
-            "OCREngine": self.OCR_ENGINE,
-            "isOverlayRequired": "true",
-            "detectOrientation": "true",
-        }
-        files = {"file": ("frame.jpg", image_bytes, "image/jpeg")}
+        engines_to_try = [self.OCR_ENGINE, self.FALLBACK_OCR_ENGINE]
+        last_error: Optional[str] = None
+        last_engine_name = "OCR.space (Engine 3)"
 
-        try:
-            response = requests.post(self.endpoint, data=payload, files=files, timeout=25)
+        for engine_number in engines_to_try:
+            payload = {
+                "apikey": self.api_key,
+                "language": lang,
+                "OCREngine": engine_number,
+                "isOverlayRequired": "true",
+                "detectOrientation": "true",
+            }
+            files = {"file": ("frame.jpg", image_bytes, "image/jpeg")}
+
+            try:
+                response = requests.post(self.endpoint, data=payload, files=files, timeout=25)
+                response.raise_for_status()
+                result_json = response.json()
+            except Exception as e:
+                last_error = f"OCR.space request error: {e}"
+                if engine_number == self.OCR_ENGINE:
+                    logger.warning(f"OCR.space Engine 3 failed ({last_error}); retrying with Engine 2.")
+                    last_engine_name = "OCR.space (Engine 2)"
+                    continue
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
+                return VisionOCRResult(
+                    success=False,
+                    error=last_error,
+                    latency_ms=latency_ms,
+                    engine_name=last_engine_name,
+                )
+
+            if result_json.get("IsErroredOnProcessing"):
+                error_msg = result_json.get("ErrorMessage") or result_json.get("ErrorDetails") or "Unknown OCR.space error"
+                if isinstance(error_msg, list):
+                    error_msg = "; ".join(str(m) for m in error_msg)
+                last_error = str(error_msg)
+                if engine_number == self.OCR_ENGINE:
+                    logger.warning(f"OCR.space Engine 3 returned an error ({last_error}); retrying with Engine 2.")
+                    last_engine_name = "OCR.space (Engine 2)"
+                    continue
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
+                return VisionOCRResult(
+                    success=False,
+                    error=last_error,
+                    latency_ms=latency_ms,
+                    engine_name=last_engine_name,
+                )
+
+            parsed_results = result_json.get("ParsedResults") or []
+            if not parsed_results:
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
+                return VisionOCRResult(
+                    success=True,
+                    full_text="",
+                    items=[],
+                    latency_ms=latency_ms,
+                    engine_name="OCR.space (Engine 3)" if engine_number == self.OCR_ENGINE else "OCR.space (Engine 2)",
+                    frame_width=image_width,
+                    frame_height=image_height,
+                )
+
+            full_text_parts: List[str] = []
+            items: List[VisionOCRItem] = []
+
+            for parsed in parsed_results:
+                if parsed.get("FileParseExitCode", 1) not in (1,):
+                    # Non-success parse for this particular result; skip its text
+                    # but keep looking at any other parsed results.
+                    continue
+
+                text = (parsed.get("ParsedText") or "").strip()
+                if text:
+                    full_text_parts.append(text)
+
+                overlay = parsed.get("TextOverlay") or {}
+                for line in overlay.get("Lines", []) or []:
+                    words = line.get("Words", []) or []
+                    if not words:
+                        continue
+
+                    # Build ONE bounding box that spans the whole line (rather
+                    # than a separate box per word) so we draw a single readable
+                    # label per line instead of one black label stacked above
+                    # every individual word -- the latter is what produced solid
+                    # black bars over dense text.
+                    lefts, tops, rights, bottoms = [], [], [], []
+                    for word in words:
+                        left = int(word.get("Left", 0))
+                        top = int(word.get("Top", 0))
+                        width = int(word.get("Width", 0))
+                        height = int(word.get("Height", 0))
+                        lefts.append(left)
+                        tops.append(top)
+                        rights.append(left + width)
+                        bottoms.append(top + height)
+
+                    x_min, y_min = min(lefts), min(tops)
+                    x_max, y_max = max(rights), max(bottoms)
+
+                    line_text = (line.get("LineText") or "").strip()
+                    if not line_text:
+                        line_text = " ".join(w.get("WordText", "") for w in words).strip()
+                    if not line_text:
+                        continue
+
+                    poly = [
+                        (x_min, y_min),
+                        (x_max, y_min),
+                        (x_max, y_max),
+                        (x_min, y_max),
+                    ]
+                    items.append(VisionOCRItem(text=line_text, confidence=1.0, bounding_poly=poly))
+
+            full_text = "\n".join(full_text_parts)
             latency_ms = (time.perf_counter() - start_time) * 1000.0
-            response.raise_for_status()
-            result_json = response.json()
-        except Exception as e:
-            latency_ms = (time.perf_counter() - start_time) * 1000.0
-            return VisionOCRResult(
-                success=False,
-                error=f"OCR.space request error: {e}",
-                latency_ms=latency_ms,
-                engine_name="OCR.space (Engine 3)",
-            )
-
-        if result_json.get("IsErroredOnProcessing"):
-            error_msg = result_json.get("ErrorMessage") or result_json.get("ErrorDetails") or "Unknown OCR.space error"
-            if isinstance(error_msg, list):
-                error_msg = "; ".join(str(m) for m in error_msg)
-            return VisionOCRResult(
-                success=False,
-                error=str(error_msg),
-                latency_ms=latency_ms,
-                engine_name="OCR.space (Engine 3)",
-            )
-
-        parsed_results = result_json.get("ParsedResults") or []
-        if not parsed_results:
             return VisionOCRResult(
                 success=True,
-                full_text="",
-                items=[],
+                full_text=full_text,
+                items=items,
                 latency_ms=latency_ms,
-                engine_name="OCR.space (Engine 3)",
+                engine_name="OCR.space (Engine 3)" if engine_number == self.OCR_ENGINE else "OCR.space (Engine 2)",
                 frame_width=image_width,
                 frame_height=image_height,
             )
 
-        full_text_parts: List[str] = []
-        items: List[VisionOCRItem] = []
-
-        for parsed in parsed_results:
-            if parsed.get("FileParseExitCode", 1) not in (1,):
-                # Non-success parse for this particular result; skip its text
-                # but keep looking at any other parsed results.
-                continue
-
-            text = (parsed.get("ParsedText") or "").strip()
-            if text:
-                full_text_parts.append(text)
-
-            overlay = parsed.get("TextOverlay") or {}
-            for line in overlay.get("Lines", []) or []:
-                words = line.get("Words", []) or []
-                if not words:
-                    continue
-
-                # Build ONE bounding box that spans the whole line (rather
-                # than a separate box per word) so we draw a single readable
-                # label per line instead of one black label stacked above
-                # every individual word -- the latter is what produced solid
-                # black bars over dense text.
-                lefts, tops, rights, bottoms = [], [], [], []
-                for word in words:
-                    left = int(word.get("Left", 0))
-                    top = int(word.get("Top", 0))
-                    width = int(word.get("Width", 0))
-                    height = int(word.get("Height", 0))
-                    lefts.append(left)
-                    tops.append(top)
-                    rights.append(left + width)
-                    bottoms.append(top + height)
-
-                x_min, y_min = min(lefts), min(tops)
-                x_max, y_max = max(rights), max(bottoms)
-
-                line_text = (line.get("LineText") or "").strip()
-                if not line_text:
-                    line_text = " ".join(w.get("WordText", "") for w in words).strip()
-                if not line_text:
-                    continue
-
-                poly = [
-                    (x_min, y_min),
-                    (x_max, y_min),
-                    (x_max, y_max),
-                    (x_min, y_max),
-                ]
-                items.append(VisionOCRItem(text=line_text, confidence=1.0, bounding_poly=poly))
-
-        full_text = "\n".join(full_text_parts)
-
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
         return VisionOCRResult(
-            success=True,
-            full_text=full_text,
-            items=items,
+            success=False,
+            error=last_error or "OCR.space request failed.",
             latency_ms=latency_ms,
-            engine_name="OCR.space (Engine 3)",
-            frame_width=image_width,
-            frame_height=image_height,
+            engine_name=last_engine_name,
         )
 
     # ------------------------------------------------------------------ #

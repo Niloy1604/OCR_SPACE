@@ -1,6 +1,9 @@
 import sys
+from unittest.mock import patch
+
 import numpy as np
 import cv2
+import requests
 
 import config
 from vision_ocr import VisionOCREngine, VisionOCRResult, VisionOCRItem, draw_ocr_overlay
@@ -103,6 +106,57 @@ def test_engine_graceful_auth_error():
         print(f"  -> Expected Auth/API Error message captured: '{res.error}'")
 
 
+def test_placeholder_text_is_treated_as_empty():
+    print("[TEST] Testing placeholder OCR text normalization...")
+    normalized = VisionOCREngine._normalize_text("*[No text detected]*")
+    assert normalized == ""
+    assert VisionOCREngine._normalize_text("  Hello world  ") == "Hello world"
+    print("  -> Placeholder OCR text is normalized correctly.")
+
+
+def test_engine_falls_back_to_engine_2_when_engine_3_fails():
+    print("[TEST] Testing OCR.space Engine 3 -> Engine 2 fallback...")
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, files=None, timeout=25):
+        if data.get("OCREngine") == "3":
+            raise requests.exceptions.HTTPError("Engine 3 token exhausted")
+        return FakeResponse(
+            {
+                "IsErroredOnProcessing": False,
+                "ParsedResults": [
+                    {
+                        "FileParseExitCode": 1,
+                        "ParsedText": "fallback text",
+                        "TextOverlay": {"Lines": []},
+                    }
+                ],
+            }
+        )
+
+    engine = VisionOCREngine()
+    engine.api_key = "dummy-key"
+    engine.endpoint = "https://example.invalid"
+    engine.mode = "OCRSPACE_ENGINE3"
+
+    with patch("vision_ocr.requests.post", side_effect=fake_post):
+        res = engine._detect_ocrspace(b"fake-image", ["en"], 640, 480)
+
+    assert res.success is True
+    assert res.full_text == "fallback text"
+    assert res.engine_name == "OCR.space (Engine 2)"
+    print("  -> Fallback to Engine 2 worked successfully.")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  Vision OCR Pipeline Diagnostic Tests")
@@ -110,6 +164,7 @@ if __name__ == "__main__":
     test_overlay_drawing()
     test_frame_encoding()
     test_engine_graceful_auth_error()
+    test_engine_falls_back_to_engine_2_when_engine_3_fails()
     print("=" * 60)
     print("[SUCCESS] All local diagnostic tests passed!")
     print("=" * 60)
