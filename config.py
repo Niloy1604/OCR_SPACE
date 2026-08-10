@@ -57,36 +57,52 @@ HEADER_BG_COLOR_BGR = (40, 40, 40)  # Dark gray header background bar
 DEDUPLICATE_CONSOLE_OUTPUT = True  # Avoid re-printing identical consecutive text in console
 
 # ------------------------------------------------------------------ #
-# AI4Bharat Indic Parler-TTS Settings
+# Piper TTS Settings (real-time, non-autoregressive, CPU-friendly)
 # ------------------------------------------------------------------ #
-# Speaks OCR-detected text aloud in the language/script it was written in.
-# Model card: https://huggingface.co/ai4bharat/indic-parler-tts
+# Speaks OCR-detected text aloud in real time. Piper is a VITS-based neural
+# TTS engine (ONNX runtime) -- fast enough for real-time use on CPU alone,
+# unlike the previous autoregressive Indic Parler-TTS backend.
+# Project: https://github.com/OHF-Voice/piper1-gpl
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "True").lower() in ("true", "1", "yes")
-TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "ai4bharat/indic-parler-tts")
-TTS_DEVICE = os.environ.get("TTS_DEVICE", "auto")  # "auto" | "cpu" | "cuda"
 
-# When False (default), the real Indic Parler-TTS model is ALWAYS used and
-# the robotic pyttsx3/SAPI voice is never invoked automatically. Set this to
-# True only if you explicitly want a fast/low-quality fallback voice to be
-# used as a last resort if the real model fails to load.
-TTS_ALLOW_ROBOTIC_FALLBACK = os.environ.get("TTS_ALLOW_ROBOTIC_FALLBACK", "False").lower() in ("true", "1", "yes")
+# Where downloaded Piper voice (.onnx/.onnx.json) files are cached.
+# Defaults to a "piper_voices" folder next to this file.
+PIPER_VOICE_DIR = os.environ.get("PIPER_VOICE_DIR", "").strip() or str(Path(__file__).parent / "piper_voices")
+
+# Maps a language code (from LANGUAGE_HINTS / OCR script detection) to a
+# specific Piper voice name. Only languages with an OFFICIAL Piper voice as
+# of Aug 2026 are pre-filled below -- check
+# https://github.com/rhasspy/piper/blob/master/VOICES.md for the current
+# full list and add more here as they become available (e.g. bn, gu, kn,
+# mr, ne, ur do not have official Piper voices yet at time of writing).
+# Any language not listed here falls back to PIPER_DEFAULT_VOICE.
+PIPER_VOICES = {
+    "en": "en_US-lessac-medium",
+    "hi": "hi_IN-pratham-medium",
+    "ml": "ml_IN-arjun-medium",
+}
+
+# Used for any language in LANGUAGE_HINTS that isn't in PIPER_VOICES above,
+# so TTS never silently fails for an unmapped language -- it just speaks
+# in the default voice instead.
+PIPER_DEFAULT_VOICE = os.environ.get("PIPER_DEFAULT_VOICE", "en_US-lessac-medium")
+
+# Language to use when a detected/requested language has no mapped Piper
+# voice yet (kept for reference; PIPER_DEFAULT_VOICE above is what's
+# actually used as the fallback voice).
+TTS_FALLBACK_LANGUAGE = os.environ.get("TTS_FALLBACK_LANGUAGE", "en")
 
 # Don't re-speak the same OCR text more than once within this window (avoids
 # nagging the user every time a stable frame re-triggers OCR on a label
 # that hasn't changed).
 TTS_MIN_REPEAT_INTERVAL_SECONDS = float(os.environ.get("TTS_MIN_REPEAT_INTERVAL_SECONDS", 4.0))
 
-# Natural-language voice-description prompt template passed to Indic
-# Parler-TTS. {speaker} and {language} are filled in per detected script.
-TTS_VOICE_DESCRIPTION_TEMPLATE = os.environ.get(
-    "TTS_VOICE_DESCRIPTION_TEMPLATE",
-    "{speaker}'s voice speaks {language} clearly at a natural, moderate pace, "
-    "with minimal background noise, suitable for a wearable accessibility assistant.",
-)
+# Piper is fast enough that a fairly generous cap is fine -- this mainly
+# exists to avoid a pathologically long single OCR block (e.g. a dense
+# document) blocking the queue for too long.
+TTS_MAX_TEXT_CHARS = int(os.environ.get("TTS_MAX_TEXT_CHARS", 400))
 
-# Parler-TTS is autoregressive -- generation time scales with text length, and
-# on CPU (no CUDA) a long multi-line OCR block (e.g. a full ID card) can take
-# well over a minute to speak. Cap how much of any single OCR result gets
-# sent to TTS so responses stay usable in real time; the full text is still
-# shown on-screen regardless.
-TTS_MAX_TEXT_CHARS = int(os.environ.get("TTS_MAX_TEXT_CHARS", 200))
+# Piper's raw output can sound quiet on some systems/speakers. This
+# multiplies the generated waveform's amplitude before playback (clipped
+# to avoid distortion). 1.0 = unchanged, 2.0 = roughly twice as loud.
+TTS_VOLUME_GAIN = float(os.environ.get("TTS_VOLUME_GAIN", 2.5))

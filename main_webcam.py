@@ -20,7 +20,7 @@ import cv2
 
 import config
 from vision_ocr import VisionOCREngine, VisionOCRResult, draw_ocr_overlay, draw_unicode_text
-from tts import IndicParlerTTSEngine
+from tts import PiperTTSEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WebcamOCR")
@@ -146,10 +146,10 @@ def main():
             "Set OCRSPACE_API_KEY in your .env to use OCR.space."
         )
 
-    tts = IndicParlerTTSEngine()
+    tts = PiperTTSEngine()
     tts_muted = not config.ENABLE_TTS
     if tts.enabled:
-        logger.info("TTS backend: AI4Bharat Indic Parler-TTS (model loads lazily on first speech request).")
+        logger.info("TTS backend: Piper (real-time, non-autoregressive; voices download lazily on first use per language).")
     else:
         logger.warning("TTS disabled (config.ENABLE_TTS=False / ENABLE_TTS env var).")
 
