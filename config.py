@@ -57,13 +57,26 @@ HEADER_BG_COLOR_BGR = (40, 40, 40)  # Dark gray header background bar
 DEDUPLICATE_CONSOLE_OUTPUT = True  # Avoid re-printing identical consecutive text in console
 
 # ------------------------------------------------------------------ #
-# Piper TTS Settings (real-time, non-autoregressive, CPU-friendly)
+# Google TTS (Algieba) & Cloud TTS (Chirp 3) Settings
 # ------------------------------------------------------------------ #
-# Speaks OCR-detected text aloud in real time. Piper is a VITS-based neural
-# TTS engine (ONNX runtime) -- fast enough for real-time use on CPU alone,
-# unlike the previous autoregressive Indic Parler-TTS backend.
-# Project: https://github.com/OHF-Voice/piper1-gpl
+GOOGLE_API_KEY = (
+    os.environ.get("GOOGLE_API_KEY", "").strip()
+    or os.environ.get("GEMINI_API_KEY", "").strip()
+    or os.environ.get("GOOGLE_TTS_API_KEY", "").strip()
+)
+GOOGLE_TTS_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "Algieba").strip()
+CHIRP3_BACKUP_VOICE = os.environ.get("CHIRP3_BACKUP_VOICE", "en-US-Chirp3-HD-Charon").strip()
+GOOGLE_TTS_MODEL = os.environ.get("GOOGLE_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+GOOGLE_TTS_TIMEOUT_SECONDS = float(os.environ.get("GOOGLE_TTS_TIMEOUT_SECONDS", "30").strip() or "30")
+GOOGLE_TTS_RETRIES = max(1, int(os.environ.get("GOOGLE_TTS_RETRIES", "2").strip() or "2"))
+
+# Text similarity threshold for deduplicating noisy OCR frames (0.0 to 1.0)
+TTS_SIMILARITY_THRESHOLD = float(os.environ.get("TTS_SIMILARITY_THRESHOLD", 0.85))
+
+# Enable/disable TTS output
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "True").lower() in ("true", "1", "yes")
+
+
 
 # Where downloaded Piper voice (.onnx/.onnx.json) files are cached.
 # Defaults to a "piper_voices" folder next to this file.

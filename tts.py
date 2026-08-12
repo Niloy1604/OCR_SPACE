@@ -1,46 +1,24 @@
 r"""
-Text-to-Speech via Piper (https://github.com/OHF-Voice/piper1-gpl).
+Multi-Level Text-to-Speech Architecture and Text Stabilization.
 
-Speaks OCR-detected text out loud in the language/script it was written in.
-Runs entirely on a background worker thread with a request queue, so calling
-`speak()` from the webcam loop never blocks frame capture or rendering.
+Architecture:
+    TTSManager
+        ├── GeminiTTSEngine (Primary: Gemini TTS with Algieba voice)
+        ├── CloudTTSChirp3Engine (Secondary: Google Cloud TTS with Chirp 3 HD voice)
+        └── PiperTTSEngine (Offline Fallback: Local Piper ONNX synthesis)
 
---------------------------------------------------------------------------
-WHY THIS REPLACES THE PREVIOUS (Indic Parler-TTS) VERSION
---------------------------------------------------------------------------
-The previous version used ai4bharat/indic-parler-tts, a ~0.9B parameter
-AUTOREGRESSIVE model: it generates audio one token at a time, which on CPU
-took ~80+ seconds to speak a single short sentence -- unusable for a
-real-time wearable device.
+Includes TextStabilizer for fuzzy text normalization & deduplication to prevent
+re-reading repeated or slightly noisy OCR output.
 
-Piper is NON-AUTOREGRESSIVE (VITS architecture, exported to ONNX, ~15-60M
-parameters per voice): it generates the entire waveform in one parallel
-pass. It runs comfortably in real time on CPU alone -- including on
-Raspberry-Pi-class hardware, which matters if this is meant to eventually
-run on constrained wearable/embedded hardware rather than a full PC.
-
---------------------------------------------------------------------------
-SETUP
---------------------------------------------------------------------------
-    pip install piper-tts
-
-Voices are downloaded automatically on first use and cached under
-config.PIPER_VOICE_DIR. You can also pre-download explicitly:
-    python -m piper.download_voices en_US-lessac-medium
-    python -m piper.download_voices hi_IN-pratham-medium
-
-See config.py's PIPER_VOICES dict to map each language code you use in
-LANGUAGE_HINTS to a specific Piper voice name. Not every language in
-LANGUAGE_HINTS necessarily has an official Piper voice yet -- check
-https://github.com/rhasspy/piper/blob/master/VOICES.md for the current
-list, and add/adjust entries in PIPER_VOICES as more become available.
-Any language without a configured voice falls back to PIPER_DEFAULT_VOICE
-(English by default) rather than failing.
---------------------------------------------------------------------------
+Runs on a non-blocking background worker thread so calls to `speak()` never block
+camera feed or OCR loops.
 """
 
+import base64
+import difflib
 import io
 import os
+import re
 import wave
 import time
 import queue
@@ -48,127 +26,352 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
+import requests
 
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("PiperTTS")
+logger = logging.getLogger("TTSManager")
 
 
 # ------------------------------------------------------------------ #
-# Script-based language detection
+# Text Stabilization & Similarity Deduplication
 # ------------------------------------------------------------------ #
-# OCR.space already narrows recognition to config.LANGUAGE_HINTS. This just
-# figures out *which* of those configured languages a given piece of
-# recognized text is actually written in (by Unicode script), so we pick
-# a matching Piper voice instead of always defaulting to English.
+
+class TextStabilizer:
+    """
+    Cleans OCR artifacts and calculates text similarity to prevent re-speaking
+    identical or slightly noisy consecutive OCR detections (e.g. "Welcome to Kolkata"
+    vs "Welcome to Kolkatta").
+    """
+
+    @staticmethod
+    def clean_text_for_speech(text: str) -> str:
+        """Strip Markdown-style artifacts (heading `#`, `*`/`_` emphasis, backticks)."""
+        cleaned = re.sub(r"#+\s*", " ", text)
+        cleaned = re.sub(r"[*_`]+", "", cleaned)
+        return " ".join(cleaned.split())
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalize case and whitespace for similarity comparison."""
+        cleaned = TextStabilizer.clean_text_for_speech(text)
+        return cleaned.strip().lower()
+
+    @staticmethod
+    def is_similar_text(text1: str, text2: str, threshold: float = 0.85) -> bool:
+        """
+        Returns True if text1 and text2 are fuzzy matches above the similarity threshold.
+        """
+        norm1 = TextStabilizer.normalize_text(text1)
+        norm2 = TextStabilizer.normalize_text(text2)
+
+        if not norm1 and not norm2:
+            return True
+        if not norm1 or not norm2:
+            return False
+        if norm1 == norm2:
+            return True
+
+        ratio = difflib.SequenceMatcher(None, norm1, norm2).ratio()
+        return ratio >= threshold
+
+
+def decode_audio_bytes(raw_bytes: bytes) -> Tuple[np.ndarray, int]:
+    """
+    Decodes audio bytes (WAV RIFF format or raw 16-bit PCM) into a float32 numpy array
+    and sample rate.
+    """
+    if not raw_bytes:
+        return np.zeros(1, dtype=np.float32), 24000
+
+    # Check for RIFF header (standard WAV)
+    if raw_bytes[:4] in (b"RIFF", b"RIFX"):
+        try:
+            buf = io.BytesIO(raw_bytes)
+            with wave.open(buf, "rb") as wav_file:
+                sample_rate = wav_file.getframerate()
+                n_frames = wav_file.getnframes()
+                sample_width = wav_file.getsampwidth()
+                frames = wav_file.readframes(n_frames)
+
+            if sample_width == 2:
+                audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sample_width == 4:
+                audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                audio = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 255.0
+
+            return audio, sample_rate
+        except Exception as e:
+            logger.debug(f"Failed WAV header decode, falling back to raw PCM: {e}")
+
+    # Raw 16-bit signed PCM mono, 24kHz default
+    audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio, 24000
+
+
+# ------------------------------------------------------------------ #
+# Common Audio Playback Layer
+# ------------------------------------------------------------------ #
+
+class AudioPlayback:
+    """Handles audio playback using sounddevice with stdlib winsound fallback."""
+
+    @staticmethod
+    def play(audio: np.ndarray, sample_rate: int):
+        gain = getattr(config, "TTS_VOLUME_GAIN", 1.0)
+        if gain != 1.0:
+            audio = np.clip(audio * gain, -1.0, 1.0)
+
+        try:
+            import sounddevice as sd
+            sd.play(audio, samplerate=sample_rate)
+            sd.wait()
+        except ImportError:
+            try:
+                import winsound
+                import tempfile
+                pcm_data = (audio * 32767).astype(np.int16).tobytes()
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    tmp_name = f.name
+                    with wave.open(tmp_name, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(pcm_data)
+                winsound.PlaySound(tmp_name, winsound.SND_FILENAME)
+                try:
+                    os.remove(tmp_name)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Audio playback unavailable: {e}")
+        except Exception as e:
+            logger.warning(f"Sounddevice playback error: {e}")
+
+
+# ------------------------------------------------------------------ #
+# Engine 1: Google Gemini TTS (Primary - Algieba Voice)
+# ------------------------------------------------------------------ #
+
+class GeminiTTSEngine:
+    """Primary TTS engine using Gemini TTS API with the Algieba voice."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or getattr(config, "GOOGLE_API_KEY", "")
+        self.voice = getattr(config, "GOOGLE_TTS_VOICE", "Algieba")
+        self.model = getattr(config, "GOOGLE_TTS_MODEL", "gemini-2.5-flash-preview-tts") or "gemini-2.5-flash-preview-tts"
+        self.request_timeout = float(getattr(config, "GOOGLE_TTS_TIMEOUT_SECONDS", 30.0) or 30.0)
+        self.max_retries = max(1, int(getattr(config, "GOOGLE_TTS_RETRIES", 2) or 2))
+
+    def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
+        if not self.api_key or self.api_key == "your_google_api_key_here":
+            raise ValueError("Gemini API key is not configured.")
+
+        # Try google-genai SDK first if available
+        try:
+            try:
+                import google.genai as genai
+                from google.genai import types  # type: ignore
+            except Exception:  # pragma: no cover - optional dependency
+                genai = None
+                types = None
+            from google.genai import types
+
+            client = genai.Client(api_key=self.api_key)
+            response = client.models.generate_content(
+                model=self.model,
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=self.voice
+                            )
+                        )
+                    ),
+                ),
+            )
+            raw_b64 = response.candidates[0].content.parts[0].inline_data.data
+            raw_bytes = base64.b64decode(raw_b64) if isinstance(raw_b64, str) else raw_b64
+            return decode_audio_bytes(raw_bytes)
+        except Exception as sdk_err:
+            logger.debug(f"google-genai SDK synthesis unavailable/failed ({sdk_err}). Trying REST API...")
+
+        # Fallback to direct REST API
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": self.voice
+                        }
+                    }
+                }
+            }
+        }
+
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                res = requests.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self.request_timeout,
+                )
+                res.raise_for_status()
+                data = res.json()
+
+                part = data["candidates"][0]["content"]["parts"][0]
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                raw_b64 = inline_data["data"]
+                raw_bytes = base64.b64decode(raw_b64)
+                return decode_audio_bytes(raw_bytes)
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    logger.warning(
+                        f"Gemini TTS REST request failed on attempt {attempt}/{self.max_retries}: {e}. Retrying..."
+                    )
+                    time.sleep(min(2 * attempt, 5))
+                    continue
+                raise last_error
+
+        raise last_error
+
+
+# ------------------------------------------------------------------ #
+# Engine 2: Google Cloud TTS (Secondary Backup - Chirp 3 HD Voice)
+# ------------------------------------------------------------------ #
+
+class CloudTTSChirp3Engine:
+    """Secondary TTS engine using Google Cloud Text-to-Speech with Chirp 3 HD voice."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or getattr(config, "GOOGLE_API_KEY", "")
+        self.voice = getattr(config, "CHIRP3_BACKUP_VOICE", "en-US-Chirp3-HD-Charon")
+
+    def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
+        # Try google-cloud-texttospeech SDK first if available
+        try:
+            from google.cloud import texttospeech
+
+            client = texttospeech.TextToSpeechClient(
+                client_options={"api_key": self.api_key} if self.api_key else None
+            )
+            input_text = texttospeech.SynthesisInput(text=text)
+            voice_params = texttospeech.VoiceSelectionParams(
+                language_code="en-US",
+                name=self.voice,
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16
+            )
+            response = client.synthesize_speech(
+                input=input_text, voice=voice_params, audio_config=audio_config
+            )
+            return decode_audio_bytes(response.audio_content)
+        except Exception as sdk_err:
+            logger.debug(f"Cloud TTS SDK synthesis unavailable/failed ({sdk_err}). Trying REST API...")
+
+        if not self.api_key or self.api_key == "your_google_api_key_here":
+            raise ValueError("Google Cloud API key is not configured.")
+
+        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={self.api_key}"
+        payload = {
+            "input": {"text": text},
+            "voice": {
+                "languageCode": "en-US",
+                "name": self.voice,
+            },
+            "audioConfig": {
+                "audioEncoding": "LINEAR16"
+            }
+        }
+        res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        raw_b64 = data["audioContent"]
+        raw_bytes = base64.b64decode(raw_b64)
+        return decode_audio_bytes(raw_bytes)
+
+
+# ------------------------------------------------------------------ #
+# Engine 3: Piper TTS (Offline Local Fallback)
+# ------------------------------------------------------------------ #
 
 _SCRIPT_RANGES = {
-    "hi": [(0x0900, 0x097F)],                      # Devanagari (Hindi/Marathi/Nepali/Sanskrit)
-    "bn": [(0x0980, 0x09FF)],                       # Bengali/Assamese
-    "gu": [(0x0A80, 0x0AFF)],                       # Gujarati
-    "kn": [(0x0C80, 0x0CFF)],                       # Kannada
-    "ml": [(0x0D00, 0x0D7F)],                       # Malayalam
-    "ta": [(0x0B80, 0x0BFF)],                       # Tamil
-    "te": [(0x0C00, 0x0C7F)],                       # Telugu
-    "or": [(0x0B00, 0x0B7F)],                       # Odia
-    "pa": [(0x0A00, 0x0A7F)],                       # Gurmukhi (Punjabi)
-    "ur": [(0x0600, 0x06FF), (0x0750, 0x077F)],      # Arabic script (Urdu)
-    "en": [(0x0041, 0x005A), (0x0061, 0x007A)],      # Latin
+    "hi": [(0x0900, 0x097F)],
+    "bn": [(0x0980, 0x09FF)],
+    "gu": [(0x0A80, 0x0AFF)],
+    "kn": [(0x0C80, 0x0CFF)],
+    "ml": [(0x0D00, 0x0D7F)],
+    "ta": [(0x0B80, 0x0BFF)],
+    "te": [(0x0C00, 0x0C7F)],
+    "or": [(0x0B00, 0x0B7F)],
+    "pa": [(0x0A00, 0x0A7F)],
+    "ur": [(0x0600, 0x06FF), (0x0750, 0x077F)],
+    "en": [(0x0041, 0x005A), (0x0061, 0x007A)],
 }
 
 
-import re
+class PiperTTSEngine:
+    """Offline local TTS fallback engine using Piper ONNX models."""
 
-def clean_text_for_speech(text: str) -> str:
-    """
-    Strip Markdown-style artifacts OCR.space sometimes adds (heading `#`
-    markers, `*`/`_` emphasis, backticks) before handing text to TTS --
-    otherwise Piper tries to literally pronounce them (e.g. reads "#" as
-    "hash" mid-sentence).
-    """
-    cleaned = re.sub(r"#+\s*", " ", text)
-    cleaned = re.sub(r"[*_`]+", "", cleaned)
-    return " ".join(cleaned.split())
+    def __init__(self):
+        self.voice_dir = getattr(config, "PIPER_VOICE_DIR", "./piper_voices")
+        self.voices_map = getattr(config, "PIPER_VOICES", {"en": "en_US-lessac-medium"})
+        self.default_voice = getattr(config, "PIPER_DEFAULT_VOICE", "en_US-lessac-medium")
+        self._loaded_voices: Dict[str, object] = {}
+        self._load_lock = threading.Lock()
 
+    def _get_voice(self, voice_name: str):
+        if voice_name in self._loaded_voices:
+            return self._loaded_voices[voice_name]
 
-def segment_by_script(text: str, allowed_hints: Optional[List[str]] = None) -> List[tuple]:
-    """
-    Split `text` into contiguous runs grouped by script (e.g. Devanagari
-    vs Latin), so each run can be spoken with the correct language's voice
-    instead of forcing one voice to read a mixed-language sentence.
-    Digits/punctuation/whitespace attach to whichever run they're inside
-    and never trigger a split on their own.
+        with self._load_lock:
+            if voice_name in self._loaded_voices:
+                return self._loaded_voices[voice_name]
 
-    Returns a list of (language_code, text_segment) tuples in order.
-    """
-    allowed = set(allowed_hints or getattr(config, "LANGUAGE_HINTS", None) or ["en"])
-    segments: List[tuple] = []
-    current_lang: Optional[str] = None
-    current_chars: List[str] = []
+            import piper
+            from piper import PiperVoice
+            from piper.download_voices import download_voice
 
-    for ch in text:
-        cp = ord(ch)
-        detected = None
-        for code, ranges in _SCRIPT_RANGES.items():
-            if code in allowed and any(lo <= cp <= hi for lo, hi in ranges):
-                detected = code
-                break
+            onnx_path = os.path.join(self.voice_dir, f"{voice_name}.onnx")
+            if not os.path.exists(onnx_path):
+                os.makedirs(self.voice_dir, exist_ok=True)
+                download_voice(voice_name, Path(self.voice_dir))
 
-        if detected is None:
-            # Punctuation/digit/space/unrecognized script -- stays part of
-            # whatever run is currently open rather than forcing a split.
-            current_chars.append(ch)
-            continue
+            voice = PiperVoice.load(onnx_path)
+            self._loaded_voices[voice_name] = voice
+            return voice
 
-        if current_lang is None:
-            current_lang = detected
-            current_chars.append(ch)
-        elif detected == current_lang:
-            current_chars.append(ch)
-        else:
-            segment_text = "".join(current_chars).strip()
-            if segment_text:
-                segments.append((current_lang, segment_text))
-            current_lang = detected
-            current_chars = [ch]
+    def synthesize(self, text: str, language: Optional[str] = None) -> Tuple[np.ndarray, int]:
+        import piper
+        voice_name = self.voices_map.get(language or "en", self.default_voice)
+        voice = self._get_voice(voice_name)
 
-    if current_chars:
-        segment_text = "".join(current_chars).strip()
-        if segment_text:
-            segments.append((current_lang or "en", segment_text))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file)
 
-    return segments if segments else [("en", text.strip())]
+        buf.seek(0)
+        return decode_audio_bytes(buf.read())
 
 
-def detect_script_language(text: str, allowed_hints: Optional[List[str]] = None) -> str:
-    """
-    Guess which configured language `text` is written in, by counting
-    characters per Unicode script block. Falls back to English if nothing
-    recognizable is found or the majority script isn't in the allowed set.
-    """
-    if not text or not text.strip():
-        return "en"
-
-    allowed = set(allowed_hints or getattr(config, "LANGUAGE_HINTS", None) or ["en"])
-    counts = {code: 0 for code in _SCRIPT_RANGES}
-
-    for ch in text:
-        cp = ord(ch)
-        for code, ranges in _SCRIPT_RANGES.items():
-            if any(lo <= cp <= hi for lo, hi in ranges):
-                counts[code] += 1
-                break
-
-    counts = {code: n for code, n in counts.items() if code in allowed and n > 0}
-    if not counts:
-        return "en" if "en" in allowed else next(iter(allowed), "en")
-
-    return max(counts, key=counts.get)
-
+# ------------------------------------------------------------------ #
+# High-Level TTS Manager
+# ------------------------------------------------------------------ #
 
 @dataclass
 class TTSRequest:
@@ -176,33 +379,20 @@ class TTSRequest:
     language: Optional[str] = None
 
 
-class PiperTTSEngine:
+class TTSManager:
     """
-    Wraps Piper TTS behind a background worker thread with a request queue.
-    Callers fire-and-forget via `speak(text)`. Piper voices are small
-    (tens of MB) and non-autoregressive, so unlike the old Parler-TTS
-    engine, loading and synthesis are both fast enough to happen inline
-    without a long "please wait" warm-up.
+    Central Manager for the Multi-Level TTS Architecture.
+    Orchestrates fallback: Gemini TTS (Algieba) -> Cloud TTS (Chirp 3) -> Piper (Offline).
     """
 
-    def __init__(
-        self,
-        voice_dir: Optional[str] = None,
-        enabled: Optional[bool] = None,
-        voices: Optional[Dict[str, str]] = None,
-        default_voice: Optional[str] = None,
-    ):
+    def __init__(self, enabled: Optional[bool] = None):
         self.enabled = getattr(config, "ENABLE_TTS", True) if enabled is None else enabled
-        self.voice_dir = voice_dir or getattr(config, "PIPER_VOICE_DIR", "./piper_voices")
-        self.voices_map = voices or getattr(config, "PIPER_VOICES", {"en": "en_US-lessac-medium"})
-        self.default_voice = default_voice or getattr(config, "PIPER_DEFAULT_VOICE", "en_US-lessac-medium")
 
-        os.makedirs(self.voice_dir, exist_ok=True)
-
-        self._loaded_voices: Dict[str, "object"] = {}  # voice_name -> PiperVoice instance
-        self._load_lock = threading.Lock()
-        self._piper_module = None
-        self._load_failed = False
+        # Initialize engines
+        self.primary_engine = GeminiTTSEngine()
+        self.secondary_engine = CloudTTSChirp3Engine()
+        self.offline_engine = PiperTTSEngine()
+        self.stabilizer = TextStabilizer()
 
         self._queue: "queue.Queue[Optional[TTSRequest]]" = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
@@ -213,105 +403,64 @@ class PiperTTSEngine:
         self._last_spoken_time = 0.0
 
         if self.enabled:
+            logger.info("TTS Manager initialized.")
+            logger.info(f"  Primary:  Gemini TTS ({config.GOOGLE_TTS_MODEL}, Voice: {config.GOOGLE_TTS_VOICE})")
+            logger.info(f"  Backup:   Google Cloud TTS (Voice: {config.CHIRP3_BACKUP_VOICE})")
+            logger.info(f"  Offline:  Piper TTS ({config.PIPER_DEFAULT_VOICE})")
             self._start_worker()
         else:
             logger.warning("TTS disabled via config.ENABLE_TTS=False.")
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle
-    # ------------------------------------------------------------------ #
-
     def _start_worker(self):
         self._worker_thread = threading.Thread(
-            target=self._worker_loop, name="PiperTTS-Worker", daemon=True
+            target=self._worker_loop, name="TTSManager-Worker", daemon=True
         )
         self._worker_thread.start()
 
-    def _get_voice(self, voice_name: str):
-        """Load (and cache) a Piper voice by name, downloading it first if
-        it isn't already present in self.voice_dir. Piper voices are small
-        (tens of MB), so this is fast even on first use -- nothing like the
-        multi-minute wait the old autoregressive model needed."""
-        if voice_name in self._loaded_voices:
-            return self._loaded_voices[voice_name]
-
-        with self._load_lock:
-            if voice_name in self._loaded_voices:
-                return self._loaded_voices[voice_name]
-
-            if self._piper_module is None:
-                import piper
-                from piper import PiperVoice
-                from piper.download_voices import download_voice
-                self._piper_module = piper
-                self._PiperVoice = PiperVoice
-                self._download_voice = download_voice
-
-            onnx_path = os.path.join(self.voice_dir, f"{voice_name}.onnx")
-            if not os.path.exists(onnx_path):
-                logger.info(f"Downloading Piper voice '{voice_name}' (~15-60MB, one-time)...")
-                self._download_voice(voice_name, Path(self.voice_dir))
-                logger.info(f"Voice '{voice_name}' downloaded.")
-
-            voice = self._PiperVoice.load(onnx_path)
-            self._loaded_voices[voice_name] = voice
-            logger.info(f"Piper voice '{voice_name}' ready.")
-            return voice
-
-    def _resolve_voice_name(self, language: str) -> str:
-        return self.voices_map.get(language, self.default_voice)
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
-
     @property
     def busy(self) -> bool:
-        """True if the worker is currently synthesizing/playing speech, or
-        has requests still waiting."""
         return self._busy or not self._queue.empty()
 
     def speak(self, text: str, language: Optional[str] = None, dedupe: bool = True):
         """
-        Queue `text` for background synthesis + playback. Non-blocking --
-        safe to call every time new OCR text arrives. Near-duplicate text
-        spoken within TTS_MIN_REPEAT_INTERVAL_SECONDS is dropped so the
-        device doesn't re-read a static label on every stable frame.
+        Queue OCR text for synthesis and playback.
+        Filters duplicates & near-similar text using TextStabilizer.
         """
-        if not self.enabled or self._load_failed or not text or not text.strip():
+        if not self.enabled or not text or not text.strip():
             return
 
-        clean = " ".join(text.strip().split())
-        clean = clean_text_for_speech(clean)
+        clean = TextStabilizer.clean_text_for_speech(text.strip())
 
         max_chars = getattr(config, "TTS_MAX_TEXT_CHARS", 400)
         if max_chars and len(clean) > max_chars:
-            truncated = clean[:max_chars].rsplit(" ", 1)[0].strip()
-            clean = truncated
+            clean = clean[:max_chars].rsplit(" ", 1)[0].strip()
 
         min_interval = getattr(config, "TTS_MIN_REPEAT_INTERVAL_SECONDS", 4.0)
+        similarity_threshold = getattr(config, "TTS_SIMILARITY_THRESHOLD", 0.85)
 
-        if (
-            dedupe
-            and clean == self._last_spoken_text
-            and (time.time() - self._last_spoken_time) < min_interval
-        ):
-            return
+        if dedupe:
+            time_since_last = time.time() - self._last_spoken_time
+            if (
+                time_since_last < min_interval
+                and TextStabilizer.is_similar_text(clean, self._last_spoken_text, threshold=similarity_threshold)
+            ):
+                logger.debug(f"Skipping duplicate/similar OCR speech request: '{clean[:40]}...'")
+                return
 
         self._last_spoken_text = clean
         self._last_spoken_time = time.time()
         self._queue.put(TTSRequest(text=clean, language=language))
 
     def stop(self):
-        """Signal the worker thread to finish and wait briefly for it."""
+        """Signals the worker thread to stop synthesis and clears remaining queue."""
         self._stop_event.set()
+        with self._queue.mutex:
+            self._queue.queue.clear()
         self._queue.put(None)
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=2.0)
 
     def wait_until_idle(self, poll_interval: float = 0.2, timeout: Optional[float] = None) -> bool:
-        """Block until the request queue is empty AND the worker isn't
-        mid-synthesis. Returns False if `timeout` elapses first."""
         start = time.time()
         while True:
             if self._queue.empty() and not self._busy:
@@ -321,7 +470,7 @@ class PiperTTSEngine:
             time.sleep(poll_interval)
 
     # ------------------------------------------------------------------ #
-    # Worker loop
+    # Worker Loop & Fallback Orchestration
     # ------------------------------------------------------------------ #
 
     def _worker_loop(self):
@@ -336,124 +485,63 @@ class PiperTTSEngine:
 
             self._busy = True
             try:
-                if request.language:
-                    segments = [(request.language, request.text)]
-                else:
-                    segments = segment_by_script(request.text)
-
-                preview = request.text[:60] + ("..." if len(request.text) > 60 else "")
-                voice_summary = " -> ".join(self._resolve_voice_name(lang) for lang, _ in segments)
-                logger.info(f"Synthesizing ({voice_summary}, {len(request.text)} chars): '{preview}'")
+                text = request.text
+                preview = text[:60] + ("..." if len(text) > 60 else "")
+                logger.info(f"Synthesizing OCR text ({len(text)} chars): '{preview}'")
                 t0 = time.perf_counter()
 
-                audio, sample_rate = self._synthesize_segments(segments)
+                audio, sr, engine_used = self._synthesize_with_fallback(text, request.language)
 
                 logger.info(
-                    f"Synthesis done in {time.perf_counter() - t0:.2f}s "
-                    f"({len(audio) / sample_rate:.1f}s of audio). Playing..."
+                    f"Speech synthesis completed via [{engine_used}] in {time.perf_counter() - t0:.2f}s "
+                    f"({len(audio) / sr:.1f}s audio). Playing..."
                 )
-                self._play(audio, sample_rate)
+                AudioPlayback.play(audio, sr)
                 logger.info("Playback finished.")
             except Exception:
-                logger.exception("TTS synthesis/playback failed for this request:")
+                logger.exception("TTS synthesis/playback error:")
             finally:
                 self._busy = False
 
-    # ------------------------------------------------------------------ #
-    # Synthesis
-    # ------------------------------------------------------------------ #
+    def _synthesize_with_fallback(self, text: str, language: Optional[str]) -> Tuple[np.ndarray, int, str]:
+        # 1. Primary: Gemini TTS (Algieba voice)
+        try:
+            audio, sr = self.primary_engine.synthesize(text)
+            if audio is not None and len(audio) > 0:
+                return audio, sr, f"Gemini TTS ({self.primary_engine.voice})"
+        except Exception as e:
+            logger.warning(f"Primary Gemini TTS failed: {e}. Trying secondary Cloud TTS (Chirp 3)...")
 
-    def _synthesize_segments(self, segments: List[tuple]):
-        """Synthesize each (language, text) segment with its own voice and
-        stitch the results into one waveform at a common sample rate, with
-        a brief pause between segments spoken in different languages."""
-        target_sr = None
-        clips: List[np.ndarray] = []
-        gap_seconds = 0.15
+        # 2. Secondary Backup: Google Cloud TTS (Chirp 3 HD voice)
+        try:
+            audio, sr = self.secondary_engine.synthesize(text)
+            if audio is not None and len(audio) > 0:
+                return audio, sr, f"Cloud TTS Backup ({self.secondary_engine.voice})"
+        except Exception as e:
+            logger.warning(f"Secondary Cloud TTS (Chirp 3) failed: {e}. Trying Piper offline fallback...")
 
-        for lang, seg_text in segments:
-            if not seg_text.strip():
-                continue
-            voice_name = self._resolve_voice_name(lang)
-            voice = self._get_voice(voice_name)
-            audio, sr = self._synthesize_one(voice, seg_text)
+        # 3. Offline Fallback: Piper TTS
+        try:
+            audio, sr = self.offline_engine.synthesize(text, language)
+            return audio, sr, "Piper Offline TTS"
+        except Exception as e:
+            logger.error(f"Offline Piper TTS failed: {e}")
 
-            if target_sr is None:
-                target_sr = sr
-            elif sr != target_sr:
-                audio = self._resample(audio, sr, target_sr)
-
-            if clips:
-                clips.append(np.zeros(int(target_sr * gap_seconds), dtype=np.float32))
-            clips.append(audio)
-
-        if not clips:
-            return np.zeros(1, dtype=np.float32), target_sr or 22050
-
-        return np.concatenate(clips), target_sr
-
-    @staticmethod
-    def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        if orig_sr == target_sr or len(audio) == 0:
-            return audio
-        duration = len(audio) / orig_sr
-        target_len = max(1, int(duration * target_sr))
-        orig_idx = np.arange(len(audio))
-        target_idx = np.linspace(0, len(audio) - 1, num=target_len)
-        return np.interp(target_idx, orig_idx, audio).astype(np.float32)
-
-    @staticmethod
-    def _synthesize_one(voice, text: str):
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wav_file:
-            voice.synthesize_wav(text, wav_file)
-
-        buf.seek(0)
-        with wave.open(buf, "rb") as wav_file:
-            sample_rate = wav_file.getframerate()
-            n_frames = wav_file.getnframes()
-            raw = wav_file.readframes(n_frames)
-            sample_width = wav_file.getsampwidth()
-
-        if sample_width == 2:
-            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        else:
-            # Fallback for any voice/config that isn't 16-bit PCM.
-            audio = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 255.0
-
-        return audio, sample_rate
-
-    @staticmethod
-    def _play(audio: np.ndarray, sample_rate: int):
-        import sounddevice as sd
-
-        gain = getattr(config, "TTS_VOLUME_GAIN", 1.0)
-        if gain != 1.0:
-            audio = np.clip(audio * gain, -1.0, 1.0)
-
-        sd.play(audio, samplerate=sample_rate)
-        sd.wait()
+        return np.zeros(1, dtype=np.float32), 24000, "Silent Fallback"
 
 
-def save_wav(audio: np.ndarray, sample_rate: int, path: str):
-    """Utility for debugging: dump a generated waveform to a .wav file."""
-    import soundfile as sf
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    sf.write(path, audio, sample_rate)
+# Backwards compatibility alias
+TTSEngine = TTSManager
 
 
 if __name__ == "__main__":
-    # Quick standalone smoke test:
-    #   python tts.py "Hello, this is a real time test."
-    #   python tts.py "आपकी दवाई की पर्ची तैयार है"
     import sys
 
-    sample_text = sys.argv[1] if len(sys.argv) > 1 else "Hello, this is a test of Piper text to speech."
-    engine = PiperTTSEngine()
-    engine.speak(sample_text)
-    logger.info("Queued. Waiting for synthesis + playback to finish...")
-    finished = engine.wait_until_idle(timeout=60)
+    sample_text = sys.argv[1] if len(sys.argv) > 1 else "Testing Multi-Level TTS Manager with Gemini Algieba voice."
+    manager = TTSManager()
+    logger.info(f"Queuing sample text: '{sample_text}'...")
+    manager.speak(sample_text)
+    finished = manager.wait_until_idle(timeout=30)
     if not finished:
-        logger.error("Timed out after 60s -- check the logs above.")
-    engine.stop()
+        logger.error("TTS test timed out after 30s.")
+    manager.stop()

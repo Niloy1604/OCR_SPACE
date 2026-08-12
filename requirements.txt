@@ -8,7 +8,11 @@ python-multipart>=0.0.6
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 
-# --- Piper TTS (real-time, non-autoregressive, CPU-only) ---
+# --- Google TTS & Cloud TTS (Chirp 3) ---
+google-genai>=0.1.0
+google-cloud-texttospeech>=2.14.0
+
+# --- Piper TTS (real-time offline fallback) ---
 piper-tts>=1.6.0
 sounddevice>=0.4.6      # audio playback
-soundfile>=0.12.1       # optional: for saving generated audio to .wav
+soundfile>=0.12.1       # optional: for saving generated audio to .wav
