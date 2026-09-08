@@ -70,9 +70,36 @@ LANGUAGE_HINTS=en,hi,bn
 
 ### 5. Run webcam OCR
 
+By default, the application auto-detects connected cameras and starts with your default camera:
+
 ```bash
 python main_webcam.py
 ```
+
+#### Multi-Camera & External Webcam Options
+
+* **List all connected webcams (laptop & external USB):**
+  ```bash
+  python main_webcam.py --list-cameras
+  ```
+
+* **Launch with an external webcam:**
+  ```bash
+  python main_webcam.py --camera 1
+  ```
+
+* **Auto-prioritize external webcam when plugged in:**
+  ```bash
+  python main_webcam.py --prefer-external
+  ```
+
+* **Live Hotkeys (while video feed is active):**
+  * Press **`w`**: Switch seamlessly between laptop webcam and external webcam without restarting
+  * Press **`0` - `9`**: Jump directly to Camera index 0, 1, 2, etc.
+  * Press **`s`**: Force instant OCR trigger
+  * Press **`m`**: Mute / Unmute Text-to-Speech (TTS)
+  * Press **`c`**: Clear detected text
+  * Press **`q`**: Quit
 
 ### 6. Run FastAPI server
 
@@ -101,6 +128,7 @@ vision_ocr_realtime/
 | `config.py`        | Loads application configuration     |
 | `vision_ocr.py`    | OCR.space API integration           |
 | `main_webcam.py`   | Real-time OpenCV webcam application |
+| `tts.py`           | Text-to-Speech (Instant Windows & Cloud AI) |
 | `app_server.py`    | FastAPI REST API                    |
 | `requirements.txt` | Python dependencies                 |
 

@@ -16,6 +16,9 @@ except ImportError:
 
 # Camera Source Configuration
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", 0))
+PREFER_EXTERNAL_WEBCAM = os.environ.get("PREFER_EXTERNAL_WEBCAM", "False").lower() in ("true", "1", "yes")
+CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "AUTO").upper()  # AUTO, DSHOW, MSMF
+MAX_CAMERA_SCAN_INDEX = int(os.environ.get("MAX_CAMERA_SCAN_INDEX", 5))
 
 # OCR.space API Settings (Read from .env file or environment variable)
 # Get a free/paid key at https://ocr.space/ocrapi
@@ -66,7 +69,7 @@ GOOGLE_API_KEY = (
 )
 GOOGLE_TTS_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "Algieba").strip()
 CHIRP3_BACKUP_VOICE = os.environ.get("CHIRP3_BACKUP_VOICE", "en-US-Chirp3-HD-Charon").strip()
-GOOGLE_TTS_MODEL = os.environ.get("GOOGLE_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+GOOGLE_TTS_MODEL = os.environ.get("GOOGLE_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
 GOOGLE_TTS_TIMEOUT_SECONDS = float(os.environ.get("GOOGLE_TTS_TIMEOUT_SECONDS", "30").strip() or "30")
 GOOGLE_TTS_RETRIES = max(1, int(os.environ.get("GOOGLE_TTS_RETRIES", "2").strip() or "2"))
 
@@ -75,6 +78,11 @@ TTS_SIMILARITY_THRESHOLD = float(os.environ.get("TTS_SIMILARITY_THRESHOLD", 0.85
 
 # Enable/disable TTS output
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "True").lower() in ("true", "1", "yes")
+
+# Preferred TTS Engine: "GEMINI" (Primary Cloud AI), "WINDOWS", or "PIPER"
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "GEMINI").upper()
+WINDOWS_TTS_VOICE = os.environ.get("WINDOWS_TTS_VOICE", "Zira").strip()
+WINDOWS_TTS_RATE = int(os.environ.get("WINDOWS_TTS_RATE", 1))
 
 
 

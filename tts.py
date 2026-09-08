@@ -16,6 +16,7 @@ camera feed or OCR loops.
 
 import base64
 import difflib
+import importlib
 import io
 import os
 import re
@@ -167,84 +168,91 @@ class GeminiTTSEngine:
         self.model = getattr(config, "GOOGLE_TTS_MODEL", "gemini-2.5-flash-preview-tts") or "gemini-2.5-flash-preview-tts"
         self.request_timeout = float(getattr(config, "GOOGLE_TTS_TIMEOUT_SECONDS", 30.0) or 30.0)
         self.max_retries = max(1, int(getattr(config, "GOOGLE_TTS_RETRIES", 2) or 2))
+        self._quota_exhausted = False
 
     def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
         if not self.api_key or self.api_key == "your_google_api_key_here":
             raise ValueError("Gemini API key is not configured.")
 
-        # Try google-genai SDK first if available
-        try:
-            try:
-                import google.genai as genai
-                from google.genai import types  # type: ignore
-            except Exception:  # pragma: no cover - optional dependency
-                genai = None
-                types = None
-            from google.genai import types
+        # Gemini TTS requires an explicit instruction to only read aloud the transcript,
+        # otherwise it returns 400 Bad Request: "Model tried to generate text, but it should only be used for TTS."
+        prompt = f"Please read the following text transcript aloud verbatim, without adding any conversational text:\n{text}"
 
-            client = genai.Client(api_key=self.api_key)
-            response = client.models.generate_content(
-                model=self.model,
-                contents=text,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=self.voice
-                            )
-                        )
-                    ),
-                ),
-            )
-            raw_b64 = response.candidates[0].content.parts[0].inline_data.data
-            raw_bytes = base64.b64decode(raw_b64) if isinstance(raw_b64, str) else raw_b64
-            return decode_audio_bytes(raw_bytes)
-        except Exception as sdk_err:
-            logger.debug(f"google-genai SDK synthesis unavailable/failed ({sdk_err}). Trying REST API...")
+        # Try candidate models across configured API keys
+        candidate_models = [self.model]
+        for fallback_m in ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]:
+            if fallback_m not in candidate_models:
+                candidate_models.append(fallback_m)
 
-        # Fallback to direct REST API
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": text}]}],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {
-                            "voiceName": self.voice
+        # Parse potential comma/semicolon-separated API keys
+        raw_keys = os.environ.get("GOOGLE_API_KEYS", "") or self.api_key
+        api_keys = [k.strip() for k in re.split(r"[,;]+", raw_keys) if k.strip()]
+        if not api_keys:
+            api_keys = [self.api_key]
+
+        last_error = None
+        for key_idx, active_key in enumerate(api_keys):
+            for current_model in candidate_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent?key={active_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {
+                                    "voiceName": self.voice
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        last_error = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                res = requests.post(
-                    url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=self.request_timeout,
-                )
-                res.raise_for_status()
-                data = res.json()
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        res = requests.post(
+                            url,
+                            json=payload,
+                            headers={"Content-Type": "application/json", "Connection": "close"},
+                            timeout=self.request_timeout,
+                        )
+                        if res.status_code != 200:
+                            err_msg = ""
+                            try:
+                                err_data = res.json()
+                                err_msg = err_data.get("error", {}).get("message", res.text)
+                            except Exception:
+                                err_msg = res.text
 
-                part = data["candidates"][0]["content"]["parts"][0]
-                inline_data = part.get("inlineData") or part.get("inline_data")
-                raw_b64 = inline_data["data"]
-                raw_bytes = base64.b64decode(raw_b64)
-                return decode_audio_bytes(raw_bytes)
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    logger.warning(
-                        f"Gemini TTS REST request failed on attempt {attempt}/{self.max_retries}: {e}. Retrying..."
-                    )
-                    time.sleep(min(2 * attempt, 5))
-                    continue
-                raise last_error
+                            if res.status_code == 429:
+                                raise RuntimeError(f"Gemini TTS quota exceeded on {current_model}: {err_msg}")
+                            raise RuntimeError(f"HTTP {res.status_code} on {current_model}: {err_msg}")
+
+                        data = res.json()
+                        part = data["candidates"][0]["content"]["parts"][0]
+                        inline_data = part.get("inlineData") or part.get("inline_data")
+                        raw_b64 = inline_data["data"]
+                        raw_bytes = base64.b64decode(raw_b64)
+                        return decode_audio_bytes(raw_bytes)
+                    except Exception as e:
+                        last_error = e
+                        err_str = str(e).lower()
+                        # If quota exceeded on this model, try next candidate model
+                        if "quota exceeded" in err_str or "429" in err_str:
+                            logger.warning(
+                                f"Gemini TTS model '{current_model}' quota/rate limit reached. Trying alternate Gemini model/key..."
+                            )
+                            break
+                        if "400" in err_str:
+                            break
+
+                        if attempt < self.max_retries:
+                            logger.warning(
+                                f"Gemini TTS request ({current_model}) attempt {attempt}/{self.max_retries} failed: {e}. Retrying..."
+                            )
+                            time.sleep(1)
+                            continue
+                        break
 
         raise last_error
 
@@ -325,12 +333,31 @@ _SCRIPT_RANGES = {
 }
 
 
+def detect_text_language(text: str) -> str:
+    """Detects the language/script of the text from unicode character ranges."""
+    for char in text:
+        cp = ord(char)
+        for lang, ranges in _SCRIPT_RANGES.items():
+            for start, end in ranges:
+                if start <= cp <= end:
+                    return lang
+    return "en"
+
+
 class PiperTTSEngine:
     """Offline local TTS fallback engine using Piper ONNX models."""
 
     def __init__(self):
         self.voice_dir = getattr(config, "PIPER_VOICE_DIR", "./piper_voices")
-        self.voices_map = getattr(config, "PIPER_VOICES", {"en": "en_US-lessac-medium"})
+        self.voices_map = getattr(
+            config,
+            "PIPER_VOICES",
+            {
+                "en": "en_US-lessac-medium",
+                "bn": "bn_BD-google-medium",
+                "hi": "hi_IN-pratham-medium",
+            },
+        )
         self.default_voice = getattr(config, "PIPER_DEFAULT_VOICE", "en_US-lessac-medium")
         self._loaded_voices: Dict[str, object] = {}
         self._load_lock = threading.Lock()
@@ -358,7 +385,8 @@ class PiperTTSEngine:
 
     def synthesize(self, text: str, language: Optional[str] = None) -> Tuple[np.ndarray, int]:
         import piper
-        voice_name = self.voices_map.get(language or "en", self.default_voice)
+        target_lang = language or detect_text_language(text)
+        voice_name = self.voices_map.get(target_lang, self.default_voice)
         voice = self._get_voice(voice_name)
 
         buf = io.BytesIO()
@@ -367,6 +395,80 @@ class PiperTTSEngine:
 
         buf.seek(0)
         return decode_audio_bytes(buf.read())
+
+
+# ------------------------------------------------------------------ #
+# Engine 4: Windows SAPI (Offline Native System TTS)
+# ------------------------------------------------------------------ #
+
+class WindowsSAPIEngine:
+    """Offline native Windows SAPI Text-to-Speech engine (zero external dependencies)."""
+
+    def __init__(self):
+        self._available = False
+        if os.name == "nt":
+            try:
+                win32com_client = importlib.import_module("win32com.client")
+                pythoncom = importlib.import_module("pythoncom")
+                pythoncom.CoInitialize()
+                speaker = win32com_client.Dispatch("SAPI.SpVoice")
+                self._available = speaker is not None
+            except Exception as e:
+                logger.debug(f"Windows SAPI not available: {e}")
+                self._available = False
+
+    @property
+    def is_available(self) -> bool:
+        return self._available
+
+    def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
+        if not self.is_available:
+            raise RuntimeError("Windows SAPI is not available.")
+
+        import tempfile
+        win32com_client = importlib.import_module("win32com.client")
+        pythoncom = importlib.import_module("pythoncom")
+        pythoncom.CoInitialize()
+
+        speaker = win32com_client.Dispatch("SAPI.SpVoice")
+        # Apply voice preference (Zira, David, etc.)
+        pref_voice = getattr(config, "WINDOWS_TTS_VOICE", "Zira").lower()
+        for v in speaker.GetVoices():
+            if pref_voice in v.GetDescription().lower():
+                speaker.Voice = v
+                break
+
+        speaker.Rate = int(getattr(config, "WINDOWS_TTS_RATE", 1))
+
+        filestream = win32com_client.Dispatch("SAPI.SpFileStream")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            filestream.Open(tmp_path, 3, False)  # 3 = SSFMCreateForWrite
+            speaker.AudioOutputStream = filestream
+            speaker.Speak(text)
+            filestream.Close()
+            speaker.AudioOutputStream = None
+
+            with open(tmp_path, "rb") as f:
+                raw_bytes = f.read()
+
+            return decode_audio_bytes(raw_bytes)
+        except Exception:
+            # Fallback to direct synchronous speaking
+            try:
+                speaker.AudioOutputStream = None
+                speaker.Speak(text)
+                return np.zeros(1, dtype=np.float32), 24000
+            except Exception as direct_err:
+                raise direct_err
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 # ------------------------------------------------------------------ #
@@ -382,16 +484,17 @@ class TTSRequest:
 class TTSManager:
     """
     Central Manager for the Multi-Level TTS Architecture.
-    Orchestrates fallback: Gemini TTS (Algieba) -> Cloud TTS (Chirp 3) -> Piper (Offline).
+    Orchestrates fallback: Gemini TTS (Algieba) -> Cloud TTS (Chirp 3) -> Piper (Offline) -> Windows SAPI (Native).
     """
 
     def __init__(self, enabled: Optional[bool] = None):
         self.enabled = getattr(config, "ENABLE_TTS", True) if enabled is None else enabled
 
-        # Initialize engines
+        self.mode = getattr(config, "TTS_ENGINE", "WINDOWS").upper()
         self.primary_engine = GeminiTTSEngine()
         self.secondary_engine = CloudTTSChirp3Engine()
         self.offline_engine = PiperTTSEngine()
+        self.windows_engine = WindowsSAPIEngine()
         self.stabilizer = TextStabilizer()
 
         self._queue: "queue.Queue[Optional[TTSRequest]]" = queue.Queue()
@@ -404,9 +507,11 @@ class TTSManager:
 
         if self.enabled:
             logger.info("TTS Manager initialized.")
-            logger.info(f"  Primary:  Gemini TTS ({config.GOOGLE_TTS_MODEL}, Voice: {config.GOOGLE_TTS_VOICE})")
-            logger.info(f"  Backup:   Google Cloud TTS (Voice: {config.CHIRP3_BACKUP_VOICE})")
-            logger.info(f"  Offline:  Piper TTS ({config.PIPER_DEFAULT_VOICE})")
+            logger.info(f"  [1] Primary:   Google Gemini TTS ({self.primary_engine.model}, Voice: {self.primary_engine.voice})")
+            logger.info(f"  [2] Secondary: Google Cloud TTS (Voice: {config.CHIRP3_BACKUP_VOICE})")
+            logger.info(f"  [3] Tertiary:  Piper Offline TTS ({config.PIPER_DEFAULT_VOICE})")
+            if self.windows_engine.is_available:
+                logger.info(f"  [4] Fallback:  Windows SAPI ({getattr(config, 'WINDOWS_TTS_VOICE', 'Zira')})")
             self._start_worker()
         else:
             logger.warning("TTS disabled via config.ENABLE_TTS=False.")
@@ -435,8 +540,8 @@ class TTSManager:
         if max_chars and len(clean) > max_chars:
             clean = clean[:max_chars].rsplit(" ", 1)[0].strip()
 
-        min_interval = getattr(config, "TTS_MIN_REPEAT_INTERVAL_SECONDS", 4.0)
-        similarity_threshold = getattr(config, "TTS_SIMILARITY_THRESHOLD", 0.85)
+        min_interval = float(getattr(config, "TTS_MIN_REPEAT_INTERVAL_SECONDS", 30.0) or 30.0)
+        similarity_threshold = float(getattr(config, "TTS_SIMILARITY_THRESHOLD", 0.85) or 0.85)
 
         if dedupe:
             time_since_last = time.time() - self._last_spoken_time
@@ -504,28 +609,38 @@ class TTSManager:
                 self._busy = False
 
     def _synthesize_with_fallback(self, text: str, language: Optional[str]) -> Tuple[np.ndarray, int, str]:
-        # 1. Primary: Gemini TTS (Algieba voice)
+        # [1] Major Focus (Primary): Google Gemini TTS (Algieba voice)
         try:
             audio, sr = self.primary_engine.synthesize(text)
             if audio is not None and len(audio) > 0:
                 return audio, sr, f"Gemini TTS ({self.primary_engine.voice})"
         except Exception as e:
-            logger.warning(f"Primary Gemini TTS failed: {e}. Trying secondary Cloud TTS (Chirp 3)...")
+            logger.warning(f"Primary Gemini TTS failed/rate-limited: {e}. Trying Google Cloud TTS...")
 
-        # 2. Secondary Backup: Google Cloud TTS (Chirp 3 HD voice)
+        # [2] Secondary Fallback: Google Cloud TTS (Chirp 3 HD voice)
         try:
             audio, sr = self.secondary_engine.synthesize(text)
             if audio is not None and len(audio) > 0:
-                return audio, sr, f"Cloud TTS Backup ({self.secondary_engine.voice})"
+                return audio, sr, f"Cloud TTS ({self.secondary_engine.voice})"
         except Exception as e:
             logger.warning(f"Secondary Cloud TTS (Chirp 3) failed: {e}. Trying Piper offline fallback...")
 
-        # 3. Offline Fallback: Piper TTS
+        # [3] Tertiary Fallback: Piper Offline TTS
         try:
             audio, sr = self.offline_engine.synthesize(text, language)
-            return audio, sr, "Piper Offline TTS"
+            if audio is not None and len(audio) > 0:
+                return audio, sr, "Piper Offline TTS"
         except Exception as e:
-            logger.error(f"Offline Piper TTS failed: {e}")
+            logger.warning(f"Offline Piper TTS failed: {e}. Trying Windows SAPI fallback...")
+
+        # [4] Quaternary Fallback: Windows SAPI (Local System Speech)
+        try:
+            if self.windows_engine.is_available:
+                audio, sr = self.windows_engine.synthesize(text)
+                if audio is not None and len(audio) > 0:
+                    return audio, sr, f"Windows SAPI ({getattr(config, 'WINDOWS_TTS_VOICE', 'Zira')})"
+        except Exception as e:
+            logger.error(f"Windows SAPI fallback failed: {e}")
 
         return np.zeros(1, dtype=np.float32), 24000, "Silent Fallback"
 

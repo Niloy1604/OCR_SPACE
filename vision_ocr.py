@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import base64
 import logging
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
@@ -7,6 +9,13 @@ import numpy as np
 import cv2
 import requests
 from PIL import Image, ImageDraw, ImageFont
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import config
 
@@ -144,15 +153,11 @@ class VisionOCREngine:
     def _resolve_request_language(cls, language_hints: Optional[List[str]]) -> str:
         """
         Decide which single `language` value to send to OCR.space.
-
-        - No hints, "auto", or more than one hint -> "auto", so Engine 3 can
-          auto-detect across its full language list (this is what lets a
-          single deployment handle English plus any of the Indian scripts
-          OCR.space supports without per-request guessing).
-        - Exactly one recognized hint -> map it to OCR.space's specific code
-          for a slightly faster/more targeted single-language pass.
+        If Bengali is requested, prioritizes 'ben'.
         """
         hints = [h.strip().lower() for h in (language_hints or []) if h and h.strip()]
+        if any(h in ("bn", "ben", "bengali", "bangla") for h in hints):
+            return "ben"
 
         if not hints or len(hints) > 1 or "auto" in hints:
             return cls.AUTO_LANGUAGE
@@ -175,6 +180,18 @@ class VisionOCREngine:
 
         effective_language_hints = language_hints or config.LANGUAGE_HINTS or ["en"]
 
+        # 1. Primary Cloud OCR: Gemini Vision (Exceptional Bengali, Hindi, & English transcription)
+        google_key = getattr(config, "GOOGLE_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+        if google_key and google_key != "your_google_api_key_here":
+            gemini_res = self._detect_gemini_vision(
+                image_bytes, effective_language_hints, image_width, image_height
+            )
+            if gemini_res.success and not gemini_res.is_empty():
+                return gemini_res
+            if gemini_res.success and gemini_res.is_empty():
+                return gemini_res
+
+        # 2. Secondary Cloud OCR: OCR.space Cloud API
         if self.api_key:
             result = self._detect_ocrspace(
                 image_bytes, effective_language_hints, image_width, image_height
@@ -186,8 +203,77 @@ class VisionOCREngine:
                 "Falling back to local offline text-region detector."
             )
 
+        # 3. Local offline fallback
         frame = self._bytes_to_frame(image_bytes)
         return self._detect_local_frame(frame)
+
+    def _detect_gemini_vision(
+        self,
+        image_bytes: bytes,
+        language_hints: Optional[List[str]],
+        image_width: int,
+        image_height: int,
+    ) -> VisionOCRResult:
+        """
+        Uses Google Gemini Vision (gemini-3.5-flash / 3.6-flash) for accurate,
+        zero-loss multilingual OCR transcription (Bengali, Hindi, English).
+        """
+        google_key = getattr(config, "GOOGLE_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+        if not google_key or google_key == "your_google_api_key_here":
+            return VisionOCRResult(success=False, error="No Google API key configured.")
+
+        start_time = time.perf_counter()
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        models_to_try = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+        prompt = (
+            "You are a verbatim OCR scanner. Extract and transcribe all text "
+            "(especially Bengali/Bangla, Hindi, English, and multilingual documents) "
+            "found in this image verbatim. Preserve exact lines and formatting. "
+            "Do not add any explanations, commentary, or quotes. "
+            "If no text is visible in the image, output strictly: [no text detected]"
+        )
+
+        for m in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={google_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                    ]
+                }],
+                "generationConfig": {
+                    "temperature": 0.0,
+                    "maxOutputTokens": 2048,
+                }
+            }
+
+            try:
+                r = requests.post(url, json=payload, headers={"Content-Type": "application/json", "Connection": "close"}, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            raw_text = parts[0].get("text", "").strip()
+                            clean = self._normalize_text(raw_text)
+                            latency = (time.perf_counter() - start_time) * 1000.0
+                            return VisionOCRResult(
+                                success=True,
+                                full_text=clean,
+                                items=[],
+                                latency_ms=latency,
+                                engine_name=f"Gemini Vision ({m})",
+                                frame_width=image_width,
+                                frame_height=image_height,
+                            )
+            except Exception as e:
+                logger.debug(f"Gemini Vision OCR attempt on {m} failed: {e}")
+                continue
+
+        return VisionOCRResult(success=False, error="Gemini Vision OCR models unavailable or rate-limited.")
 
     def detect_text_from_cv2_frame(
         self,
@@ -227,7 +313,9 @@ class VisionOCREngine:
         start_time = time.perf_counter()
         lang = self._resolve_request_language(language_hints)
 
-        engines_to_try = [self.OCR_ENGINE, self.FALLBACK_OCR_ENGINE]
+        engines_to_try = [self.OCR_ENGINE]
+        if lang != "ben":
+            engines_to_try.append(self.FALLBACK_OCR_ENGINE)
         last_error: Optional[str] = None
         last_engine_name = "OCR.space (Engine 3)"
 
