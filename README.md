@@ -109,6 +109,28 @@ uvicorn app_server:app --reload
 
 ---
 
+## 🍓 Raspberry Pi 5 Quick Start
+
+Running on a Raspberry Pi 5 (Raspberry Pi OS 64-bit Bookworm):
+
+1. **Automated Setup:**
+   ```bash
+   chmod +x setup_rpi.sh
+   ./setup_rpi.sh
+   ```
+2. **Run (Desktop / Monitor connected):**
+   ```bash
+   python main_webcam.py
+   ```
+3. **Run Headless (Over SSH / without a monitor):**
+   ```bash
+   python main_webcam.py --headless
+   ```
+
+👉 See the comprehensive [Raspberry Pi 5 Setup Guide (RPI5_SETUP.md)](file:///d:/OCRSPACE/RPI5_SETUP.md) for camera options, audio configuration (USB/HDMI/Bluetooth), systemd auto-start service, and performance tuning.
+
+---
+
 ## 📁 Project Structure
 
 ```text

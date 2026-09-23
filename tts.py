@@ -132,7 +132,12 @@ class AudioPlayback:
             import sounddevice as sd
             sd.play(audio, samplerate=sample_rate)
             sd.wait()
-        except ImportError:
+            return
+        except Exception as sd_err:
+            logger.debug(f"sounddevice playback failed or not available: {sd_err}")
+
+        # Fallback 1: Windows built-in winsound
+        if os.name == "nt":
             try:
                 import winsound
                 import tempfile
@@ -149,10 +154,33 @@ class AudioPlayback:
                     os.remove(tmp_name)
                 except Exception:
                     pass
+                return
             except Exception as e:
-                logger.warning(f"Audio playback unavailable: {e}")
+                logger.warning(f"Windows audio playback failed: {e}")
+
+        # Fallback 2: Linux / Raspberry Pi OS (aplay / pw-play / paplay)
+        try:
+            import subprocess
+            import shutil
+            import tempfile
+            pcm_data = (audio * 32767).astype(np.int16).tobytes()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_name = f.name
+                with wave.open(tmp_name, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm_data)
+
+            player = shutil.which("aplay") or shutil.which("pw-play") or shutil.which("paplay")
+            if player:
+                subprocess.run([player, "-q", tmp_name], check=False)
+            try:
+                os.remove(tmp_name)
+            except Exception:
+                pass
         except Exception as e:
-            logger.warning(f"Sounddevice playback error: {e}")
+            logger.warning(f"Linux/Raspberry Pi audio playback failed: {e}")
 
 
 # ------------------------------------------------------------------ #

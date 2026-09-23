@@ -47,11 +47,14 @@ def get_backend_candidates(backend_pref: str = "AUTO") -> List[int]:
         return [cv2.CAP_DSHOW, cv2.CAP_ANY]
     elif pref == "MSMF":
         return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+    elif pref == "V4L2":
+        return [cv2.CAP_V4L2, cv2.CAP_ANY]
     elif pref == "AUTO":
         if os.name == "nt":
             # On Windows, DirectShow is vastly more reliable for external USB webcams
             return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-        return [cv2.CAP_ANY]
+        # On Linux / Raspberry Pi OS, V4L2 is the standard backend for cameras
+        return [cv2.CAP_V4L2, cv2.CAP_ANY]
     return [cv2.CAP_ANY]
 
 
@@ -254,8 +257,14 @@ def parse_args():
         "--backend",
         type=str,
         default=getattr(config, "CAMERA_BACKEND", "AUTO"),
-        choices=["AUTO", "DSHOW", "MSMF"],
-        help="OpenCV capture backend to use (default: AUTO, uses DirectShow on Windows)",
+        choices=["AUTO", "DSHOW", "MSMF", "V4L2"],
+        help="OpenCV capture backend to use (default: AUTO, uses DirectShow on Windows, V4L2 on Linux/RPi)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run without GUI windows (ideal for Raspberry Pi over SSH or as a background service)",
     )
     parser.add_argument(
         "--width",
@@ -367,8 +376,12 @@ def main():
         )
         sys.exit(1)
 
-    cv2.namedWindow(config.WINDOW_TITLE, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(config.OCR_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    is_headless = args.headless or (os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"))
+    if not is_headless:
+        cv2.namedWindow(config.WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(config.OCR_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    else:
+        logger.info("Running in HEADLESS mode (no GUI window). OCR & TTS are active. Press Ctrl+C to stop.")
 
     executor = ThreadPoolExecutor(max_workers=1)
     ocr_future = None
@@ -554,10 +567,13 @@ def main():
                 error_msg=error_msg,
             )
 
-            cv2.imshow(config.WINDOW_TITLE, final_frame)
-            cv2.imshow(config.OCR_WINDOW_TITLE, progress_frame)
-
-            key = cv2.waitKey(1) & 0xFF
+            if not is_headless:
+                cv2.imshow(config.WINDOW_TITLE, final_frame)
+                cv2.imshow(config.OCR_WINDOW_TITLE, progress_frame)
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                time.sleep(0.01)
+                key = 255
             if key == ord("q"):
                 break
             elif key == ord("s"):
@@ -642,7 +658,8 @@ def main():
         tts.stop()
         if cap is not None:
             cap.release()
-        cv2.destroyAllWindows()
+        if not is_headless:
+            cv2.destroyAllWindows()
         logger.info("Webcam application closed.")
 
 
